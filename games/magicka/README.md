@@ -1,6 +1,6 @@
 # games/magicka — Magicka
 
-Placeholder for the Magicka submodule (`<REPO-LINK>`). Status: **work in
+Placeholder for the Magicka submodule (repo not published yet). Status: **work in
 progress**.
 
 Magicka 1 is XNA 3.1 / D3D9. Under Wine that means wined3d → OpenGL (Apple's

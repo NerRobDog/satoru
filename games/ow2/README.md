@@ -1,6 +1,6 @@
 # games/ow2 — Overwatch 2
 
-Placeholder for the Overwatch 2 submodule (`<REPO-LINK>`). Status:
+Placeholder for the Overwatch 2 submodule (repo not published yet). Status:
 **playable**, install still hand-driven — the launcher shows it as WIP until a
 `setup.sh` exists.
 
