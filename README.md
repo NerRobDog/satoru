@@ -87,5 +87,5 @@ shader caches, no Apple D3DMetal are distributed anywhere in this tree.
 
 ## Support
 
-Free, open, and staying that way. If it helped: https://github.com/NerRobDog/satoru/blob/main/DONATE.md — see
+Free, open, and staying that way. If it helped: see
 [`DONATE.md`](DONATE.md) for what the money is used for.
