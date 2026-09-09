@@ -1,0 +1,19 @@
+[game]
+name   = "Age of Empires IV"
+id     = "aoe4"
+status = "rc"
+home   = "~/aoe4-pack"
+
+setup        = "bash games/aoe4/setup.sh"
+launch       = "~/aoe4-pack/aoe4.sh"
+launch_plain = "~/aoe4-pack/aoe4.sh --plain"
+profile      = "~/aoe4-pack/README-local.txt"
+logs         = "~/aoe4-pack/logs"
+
+notes = """
+dxmt-aoe4-pack v0.1 release candidate. Own Wine engine (LGPL source + Rosetta
+patch + relocator diff) + x87sidecar, no GameToMac. Setup: --clone from a
+CrossOver bottle or --fresh (Steam installed into a new prefix, no CrossOver).
+Flat 60 on M1 Pro 16 GB and M5 Air; keep Fullscreen Desktop; close the browser
+on 16 GB; plug in. Tested vs AI only.
+"""

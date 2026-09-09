@@ -1,0 +1,10 @@
+[game]
+name   = "Magicka"
+id     = "magicka"
+status = "wip"
+home   = "~/magicka-fna"
+
+notes = """
+FNA port in progress (native, no Wine): tutorial playable with VFX/light/voices;
+binary shadows and M5 tests open. No setup or launch commands yet.
+"""

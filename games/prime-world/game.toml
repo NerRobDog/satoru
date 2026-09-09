@@ -1,0 +1,10 @@
+[game]
+name   = "Prime World"
+id     = "prime-world"
+status = "wip"
+home   = "~/pw-pack"
+
+notes = """
+Offline 5v5 vs bots plays on M1 (CI Release build). Battle 13-20 fps: x87 under
+Rosetta; SSE2 rebuild pending. No setup or launch commands yet.
+"""
