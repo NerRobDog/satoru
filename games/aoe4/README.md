@@ -44,7 +44,7 @@ meantime; its own `INSTALL.md` is the full guide.
 
 Tied to one game build (the Wine patch hard-codes addresses; `setup.sh` refuses
 other `RelicCardinal.exe` hashes). Keep the display mode at Fullscreen Desktop.
-On 16 GB machines close the browser. Plug in. Tested vs AI only.
+On 16 GB machines close the browser. Plug in. Online 2v2 between two Macs on this pack works (2–3 h sessions); vs humans untested.
 
 ## Support
 

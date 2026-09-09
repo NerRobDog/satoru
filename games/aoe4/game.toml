@@ -15,5 +15,5 @@ dxmt-aoe4-pack v0.1 release candidate. Own Wine engine (LGPL source + Rosetta
 patch + relocator diff) + x87sidecar. Setup: --clone from a
 CrossOver bottle or --fresh (Steam installed into a new prefix, no CrossOver).
 Flat 60 on M1 Pro 16 GB and M5 Air; keep Fullscreen Desktop; close the browser
-on 16 GB; plug in. Tested vs AI only.
+on 16 GB; plug in. Online 2v2 between two Macs on this pack works; vs humans untested.
 """
