@@ -1,6 +1,6 @@
 # games/aoe4 — Age of Empires IV
 
-Submodule placeholder for **dxmt-aoe4-pack** (`<REPO-LINK>`), the standalone
+Submodule placeholder for **dxmt-aoe4-pack** (https://github.com/NerRobDog/dxmt-aoe4-pack), the standalone
 pack that runs Age of Empires IV (D3D12-only, Arxan-protected) on Apple
 Silicon. Status: **release candidate v0.1**.
 
@@ -38,7 +38,7 @@ for an A/B. The per-machine profile setup chose (pace, image quality) is in
 `~/aoe4-pack/telemetry/`.
 
 Until the submodule is added, `setup.sh` is not here and the launcher says
-`missing: games/aoe4/setup.sh`. Get the pack from `<REPO-LINK>` in the
+`missing: games/aoe4/setup.sh`. Get the pack from https://github.com/NerRobDog/dxmt-aoe4-pack in the
 meantime; its own `INSTALL.md` is the full guide.
 
 ## Known limits (short)

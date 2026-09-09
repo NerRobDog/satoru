@@ -7,10 +7,10 @@ find it.
 
 | Directory | Submodule | State |
 |---|---|---|
-| `aoe4/` | dxmt-aoe4-pack — `<REPO-LINK>` | release candidate v0.1; the pack has its own `README.md`, `INSTALL.md`, `setup.sh`, `aoe4.sh` |
-| `ow2/` | `<REPO-LINK>` | stub: notes + reference `dxmt.conf`, no setup script yet |
-| `magicka/` | `<REPO-LINK>` | stub: FNA port in progress |
-| `prime-world/` | `<REPO-LINK>` | stub: CI build, offline matches |
+| `aoe4/` | dxmt-aoe4-pack — https://github.com/NerRobDog/dxmt-aoe4-pack | release candidate v0.1; the pack has its own `README.md`, `INSTALL.md`, `setup.sh`, `aoe4.sh` |
+| `ow2/` | _(repo not published yet)_ | stub: notes + reference `dxmt.conf`, no setup script yet |
+| `magicka/` | _(repo not published yet)_ | stub: FNA port in progress |
+| `prime-world/` | _(repo not published yet)_ | stub: CI build, offline matches |
 
 Until the submodules are wired (`git submodule add <url> games/aoe4`), the
 directories hold only a `README.md` and a `game.toml`; the launcher reports the

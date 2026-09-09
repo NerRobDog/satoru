@@ -1,6 +1,6 @@
 # games/prime-world — Prime World
 
-Placeholder for the Prime World submodule (`<REPO-LINK>`). Status: **work in
+Placeholder for the Prime World submodule (_(repo not published yet)_). Status: **work in
 progress**.
 
 A full offline 5v5 match against bots plays on an M1 — the first time the game
