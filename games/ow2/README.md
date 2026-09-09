@@ -24,4 +24,4 @@ and any game files.
 
 ## Support
 
-`<DONATE-LINK>` — see the umbrella `DONATE.md`.
+https://github.com/NerRobDog/satoru/blob/main/DONATE.md — see the umbrella `DONATE.md`.

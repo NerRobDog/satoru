@@ -51,4 +51,4 @@ Rules the launcher applies:
 
 ## Support
 
-Every game here is free and open. `<DONATE-LINK>` — see `../DONATE.md`.
+Every game here is free and open. https://github.com/NerRobDog/satoru/blob/main/DONATE.md — see `../DONATE.md`.

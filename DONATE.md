@@ -1,16 +1,17 @@
-# Support satoru
+# Support
 
-Everything here is open source and free, and stays that way. If it saved you a
-purchase of a closed launcher, or an evening of fiddling, you can send some of
-that back:
+Everything here is free and open source, built and tested on my own Macs. If it saved you a
+licence or an evening, you can send something back. Card and PayPal processors are not available
+in my country, so it is crypto for now:
 
-- **Donate:** `<DONATE-LINK>`
+| Network | Address |
+|---|---|
+| USDT — TRC20 (Tron) | `TB9HoMdxHsXwzMeUCieDAaivtrwodipMBu` |
+| USDT — TON | `UQDHa0aU0Bzy5jz-b5meMtAve1g_YkLPl_U2R_buiQpQGChx` |
+| BTC | `bc1q4ypqk20rmqqkudx4d9xen6rycq6jrr8usd7jcr` |
 
-What the money goes to, in order: a second test machine per chip generation
-(M1 / M2 / M5 today; frametime tables need every one of them), electricity for
-the 30-minute matches we log, and nothing else. No paid tier, no "pro" build,
-no features behind the link.
+Send USDT only on the network named in the row (TRC20 to the TRC20 address, TON to the TON
+address) — a transfer on the wrong network is lost.
 
-Non-money help that is just as welcome: a 20-minute match on a chip we do not
-have with the frame log attached (`~/aoe4-pack/telemetry/`), a bug report with
-the `logs/` folder, or a pull request.
+No obligation, no tiers, nothing unlocks. Bug reports, frame logs from your Mac and pull
+requests are worth as much.

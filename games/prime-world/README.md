@@ -13,4 +13,4 @@ sidecar). Lobby 90–105 fps, battle 13–20 fps on the debug build.
 
 ## Support
 
-`<DONATE-LINK>` — see the umbrella `DONATE.md`.
+https://github.com/NerRobDog/satoru/blob/main/DONATE.md — see the umbrella `DONATE.md`.

@@ -48,4 +48,4 @@ On 16 GB machines close the browser. Plug in. Online 2v2 between two Macs on thi
 
 ## Support
 
-`<DONATE-LINK>` — see the umbrella `DONATE.md`.
+https://github.com/NerRobDog/satoru/blob/main/DONATE.md — see the umbrella `DONATE.md`.
