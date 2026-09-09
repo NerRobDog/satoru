@@ -12,6 +12,7 @@ do nothing; actions whose script is not on disk say "missing".
     python3 launcher/satoru.py --version  # what this build is, and which packs it knows
 """
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -73,6 +74,60 @@ ACTIONS = (
 # TOML: tomllib on 3.11+, otherwise a minimal reader for the game.toml subset
 # ([section], key = "string" | 123 | true | false | """multi-line""", # comments)
 
+def _parse_scalar(val, lineno):
+    """A bare value: string, bool or integer. Everything else is an error, loudly."""
+    val = val.strip()
+    if val.startswith('"') and val.endswith('"') and len(val) >= 2:
+        return val[1:-1].replace('\\"', '"').replace("\\n", "\n")
+    val = val.split("#", 1)[0].strip()
+    if val == "true":
+        return True
+    if val == "false":
+        return False
+    try:
+        return int(val)
+    except ValueError:
+        raise ValueError("line %d: unsupported value %r" % (lineno, val))
+
+
+def _parse_array(val, lineno):
+    """A single-line array: ["a", "b"]. Enough for [requires] tools, and no more.
+
+    Scanning for the closing bracket has to ignore one inside a string, or a path
+    with a bracket in it would end the array early.
+    """
+    depth, end, in_str = 0, -1, False
+    for pos, ch in enumerate(val):
+        if ch == '"' and (pos == 0 or val[pos - 1] != "\\"):
+            in_str = not in_str
+        elif not in_str and ch == "[":
+            depth += 1
+        elif not in_str and ch == "]":
+            depth -= 1
+            if depth == 0:
+                end = pos
+                break
+    if end == -1:
+        raise ValueError(
+            "line %d: unterminated array (multi-line arrays are not supported, "
+            "keep it on one line)" % lineno)
+    body = val[1:end].strip()
+    if not body:
+        return []
+    items, cur_item, in_str = [], "", False
+    for pos, ch in enumerate(body):
+        if ch == '"' and (pos == 0 or body[pos - 1] != "\\"):
+            in_str = not in_str
+            cur_item += ch
+        elif ch == "," and not in_str:
+            items.append(cur_item)
+            cur_item = ""
+        else:
+            cur_item += ch
+    items.append(cur_item)
+    return [_parse_scalar(x, lineno) for x in items if x.strip()]
+
+
 def _parse_minimal_toml(text):
     data = {}
     cur = data
@@ -118,16 +173,10 @@ def _parse_minimal_toml(text):
                 raise ValueError("line %d: unterminated string" % i)
             cur[key] = val[1:end].replace('\\"', '"').replace("\\n", "\n")
             continue
-        val = val.split("#", 1)[0].strip()
-        if val == "true":
-            cur[key] = True
-        elif val == "false":
-            cur[key] = False
-        else:
-            try:
-                cur[key] = int(val)
-            except ValueError:
-                raise ValueError("line %d: unsupported value %r" % (i, val))
+        if val.startswith("["):
+            cur[key] = _parse_array(val, i)
+            continue
+        cur[key] = _parse_scalar(val, i)
     return data
 
 
@@ -145,6 +194,137 @@ def load_toml(path):
 
 # ----------------------------------------------------------------------------
 # model
+
+# ----------------------------------------------------------------------------
+# the pack manifest (contract v1)
+
+CONTRACT = 1
+
+_V1_SECTIONS = ("game", "source", "requires", "install", "commands", "paths")
+_GAME_KEYS = ("id", "name", "status", "summary", "notes")
+_SOURCE_KEYS = ("kind", "url", "sha256", "size", "version", "check")
+_REQUIRES_KEYS = ("arch", "macos", "rosetta", "disk_gb", "tools")
+_INSTALL_KEYS = ("home_authoritative", "foreign_note", "manual_url", "home")
+_COMMAND_KEYS = ("preflight", "install", "launch", "launch_plain", "uninstall", "update")
+_PATH_KEYS = ("profile", "logs")
+
+# What the packs ship today: one flat [game] table with the commands inside it.
+# All four are this shape, so it stays supported rather than being a migration.
+_LEGACY_KEYS = ("id", "name", "status", "home", "notes", "summary",
+                "setup", "launch", "launch_plain", "profile", "logs")
+
+_ID_OK = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+
+def _blank_manifest():
+    return {
+        "contract": 0,
+        "game": {"id": "", "name": "", "status": "wip", "summary": "", "notes": ""},
+        "source": None,
+        "requires": {"arch": None, "macos": None, "rosetta": False,
+                     "disk_gb": 0, "tools": []},
+        "install": {"home_authoritative": True, "foreign_note": "",
+                    "manual_url": "", "home": ""},
+        "commands": dict((k, "") for k in _COMMAND_KEYS),
+        "paths": dict((k, "") for k in _PATH_KEYS),
+    }
+
+
+def _take(section, keys, errors, where):
+    """Copy the keys we know about; anything else is a typo, and says so."""
+    out = {}
+    for k, v in section.items():
+        if k in keys:
+            out[k] = v
+        else:
+            errors.append("%s: unknown key %r" % (where, k))
+    return out
+
+
+def parse_manifest(data):
+    """(manifest, errors). Errors are for humans; the manifest is always usable."""
+    m = _blank_manifest()
+    errors = []
+
+    contract = data.get("contract", 0)
+    if not isinstance(contract, int):
+        errors.append("contract must be a number, got %r" % (contract,))
+        contract = 0
+    elif contract > CONTRACT:
+        errors.append(
+            "the pack needs contract %d, this satoru speaks %d - update satoru"
+            % (contract, CONTRACT))
+    m["contract"] = contract
+
+    if contract == 0:
+        game = data.get("game", {})
+        known = _take(game, _LEGACY_KEYS, errors, "[game]")
+        for k in ("id", "name", "status", "notes", "summary"):
+            if k in known:
+                m["game"][k] = known[k]
+        m["install"]["home"] = known.get("home", "")
+        # setup was the old name for install; the rest kept theirs
+        m["commands"]["install"] = known.get("setup", "")
+        for k in ("launch", "launch_plain"):
+            m["commands"][k] = known.get(k, "")
+        for k in _PATH_KEYS:
+            m["paths"][k] = known.get(k, "")
+        for name in data:
+            if name not in ("game", "contract"):
+                errors.append("unknown section [%s]" % name)
+    else:
+        for name in data:
+            if name not in _V1_SECTIONS and name != "contract":
+                errors.append("unknown section [%s]" % name)
+        m["game"].update(_take(data.get("game", {}), _GAME_KEYS, errors, "[game]"))
+        m["requires"].update(
+            _take(data.get("requires", {}), _REQUIRES_KEYS, errors, "[requires]"))
+        m["install"].update(
+            _take(data.get("install", {}), _INSTALL_KEYS, errors, "[install]"))
+        m["commands"].update(
+            _take(data.get("commands", {}), _COMMAND_KEYS, errors, "[commands]"))
+        m["paths"].update(_take(data.get("paths", {}), _PATH_KEYS, errors, "[paths]"))
+        if "source" in data:
+            src = dict((k, None) for k in _SOURCE_KEYS)
+            src.update(_take(data["source"], _SOURCE_KEYS, errors, "[source]"))
+            m["source"] = src
+
+    # --- what has to be true whichever shape it came in ---
+    gid = m["game"]["id"]
+    if not gid:
+        errors.append("[game] id is required")
+    elif not _ID_OK.match(str(gid)):
+        errors.append("[game] id %r must be lower-case letters, digits and dashes" % gid)
+    if not m["game"]["name"]:
+        errors.append("[game] name is required")
+    if m["game"]["status"] not in STATUSES:
+        errors.append("[game] status %r must be one of %s"
+                      % (m["game"]["status"], ", ".join(STATUSES)))
+
+    req = m["requires"]
+    if not isinstance(req["tools"], list):
+        errors.append("[requires] tools must be a list")
+        req["tools"] = []
+    if not isinstance(req["rosetta"], bool):
+        errors.append("[requires] rosetta must be true or false")
+        req["rosetta"] = bool(req["rosetta"])
+    if not isinstance(req["disk_gb"], int):
+        errors.append("[requires] disk_gb must be a number")
+        req["disk_gb"] = 0
+
+    src = m["source"]
+    if src is not None:
+        # A source without a hash is a download nobody can check. Refuse it here
+        # rather than discovering it after 133 MB have arrived.
+        if not src.get("kind"):
+            errors.append("[source] kind is required")
+        if src.get("kind") == "release":
+            for k in ("url", "sha256"):
+                if not src.get(k):
+                    errors.append("[source] %s is required for kind = \"release\"" % k)
+
+    return m, errors
+
 
 def expand(p):
     return os.path.expandvars(os.path.expanduser(p))
