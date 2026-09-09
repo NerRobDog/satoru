@@ -12,8 +12,10 @@ do nothing; actions whose script is not on disk say "missing".
     python3 launcher/satoru.py --version  # what this build is, and which packs it knows
 """
 import os
+import platform
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 
@@ -193,9 +195,6 @@ def load_toml(path):
 
 
 # ----------------------------------------------------------------------------
-# model
-
-# ----------------------------------------------------------------------------
 # the pack manifest (contract v1)
 
 CONTRACT = 1
@@ -324,6 +323,140 @@ def parse_manifest(data):
                     errors.append("[source] %s is required for kind = \"release\"" % k)
 
     return m, errors
+
+
+# ----------------------------------------------------------------------------
+# [requires]: what the machine has to be before a pack is worth downloading
+
+class SystemProbe(object):
+    """Everything the checks want to know about this Mac, in one injectable place.
+
+    Tests hand in a fake, which is how an Intel Mac with no Rosetta and a full
+    disk get tested from an M1 with 200 GB free.
+    """
+
+    def arch(self):
+        return platform.machine()
+
+    def macos_version(self):
+        return platform.mac_ver()[0]
+
+    def has_rosetta(self):
+        # The probe setup.sh already uses: if x86_64 code cannot run, Rosetta is absent.
+        try:
+            with open(os.devnull, "wb") as null:
+                return subprocess.call(["/usr/bin/arch", "-x86_64", "/usr/bin/true"],
+                                       stdout=null, stderr=null) == 0
+        except OSError:
+            return False
+
+    def free_gb(self, path=None):
+        st = os.statvfs(path or os.path.expanduser("~"))
+        return st.f_bavail * st.f_frsize / float(1024 ** 3)
+
+    def which(self, tool):
+        return shutil.which(tool)
+
+
+# Where a missing tool comes from. Deliberately a hint and not a command we run:
+# installing packages on someone's behalf is a bigger promise than this makes.
+TOOL_HINTS = {
+    "ffmpeg": "brew install ffmpeg",
+    "gh": "brew install gh",
+    "dotnet": "install the .NET 8 SDK (arm64) from dotnet.microsoft.com",
+    "python3": "xcode-select --install",
+}
+
+
+def _version_tuple(text):
+    return tuple(int(x) for x in str(text).strip().split("."))
+
+
+def _version_at_least(have, want):
+    """`want` is ">=26", or a bare "26" which means the same thing."""
+    want = str(want).strip()
+    if want.startswith(">="):
+        want = want[2:].strip()
+    elif want.startswith(">"):
+        want = want[1:].strip()
+    a, b = _version_tuple(have), _version_tuple(want)
+    size = max(len(a), len(b))
+    return a + (0,) * (size - len(a)) >= b + (0,) * (size - len(b))
+
+
+def _result(rid, label, ok, detail="", fix=None):
+    return {"id": rid, "label": label, "ok": ok, "detail": detail, "fix": fix}
+
+
+def check_requirements(requires, probe=None, root=None):
+    """One result per declared requirement, in the order the TUI shows them.
+
+    `fix` is the whole point: {"kind": "command"} we can run, {"kind": "manual"}
+    only they can, None nobody can. The screen must never offer an action that
+    does not exist.
+    """
+    probe = probe or SystemProbe()
+    out = []
+
+    want_arch = requires.get("arch")
+    if want_arch:
+        have = probe.arch()
+        ok = have == want_arch
+        out.append(_result(
+            "arch", "Apple Silicon" if want_arch == "arm64" else want_arch, ok,
+            "" if ok else "this Mac is %s, the pack needs %s" % (have, want_arch),
+            None))  # nothing turns an Intel Mac into an M-series one
+
+    want_macos = requires.get("macos")
+    if want_macos:
+        have = probe.macos_version()
+        try:
+            ok = _version_at_least(have, want_macos)
+            detail = "" if ok else "macOS %s, the pack needs %s" % (have, want_macos)
+            fix = None if ok else {"kind": "manual",
+                                   "hint": "System Settings -> General -> Software Update"}
+        except ValueError:
+            ok, fix = False, None
+            detail = "cannot read the version requirement %r" % (want_macos,)
+        out.append(_result("macos", "macOS %s" % want_macos, ok, detail, fix))
+
+    if requires.get("rosetta"):
+        ok = probe.has_rosetta()
+        out.append(_result(
+            "rosetta", "Rosetta", ok, "" if ok else "not installed",
+            None if ok else {
+                "kind": "command",
+                # No --agree-to-license: the licence is theirs to read, not ours to accept.
+                "run": "softwareupdate --install-rosetta",
+                "label": "Install Rosetta"}))
+
+    want_gb = requires.get("disk_gb") or 0
+    if want_gb:
+        free = probe.free_gb(root)
+        ok = free >= want_gb
+        out.append(_result(
+            "disk", "%d GB free" % want_gb, ok,
+            "" if ok else "%.1f GB free, the pack needs %d GB" % (free, want_gb),
+            None if ok else {"kind": "manual",
+                             "hint": "free up space, or point root= at another disk"}))
+
+    for tool in requires.get("tools") or []:
+        found = probe.which(tool)
+        out.append(_result(
+            "tool:%s" % tool, tool, bool(found), found or "not on PATH",
+            None if found else {
+                "kind": "manual",
+                "hint": TOOL_HINTS.get(tool, "install %s and put it on PATH" % tool)}))
+
+    return out
+
+
+def all_met(results):
+    return all(r["ok"] for r in results)
+
+
+# ----------------------------------------------------------------------------
+# model
 
 
 def expand(p):
