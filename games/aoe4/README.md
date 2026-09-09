@@ -14,8 +14,7 @@ What is in the pack (all with source, ~450 MB unpacked):
    26.3 / Wine 11.0 source with Marc Ibrahim's Rosetta patch (the invalid-opcode
    exceptions the anti-tamper uses as control flow are handled in-process, and
    the code fragments are cached so Rosetta translates each once) plus our
-   relocator extension for near conditional branches. **GameToMac is not used
-   or needed.**
+   relocator extension for near conditional branches.
 3. **x87sidecar** (`Helpers/`, MIT) — attaches to the game process only; no SIP
    changes, no root.
 

@@ -26,7 +26,7 @@ carry the hashes.
 
 | Game | Status | Where | Notes |
 |---|---|---|---|
-| Age of Empires IV | **release candidate v0.1** | [`games/aoe4`](games/aoe4/) → https://github.com/NerRobDog/dxmt-aoe4-pack | own Wine engine (LGPL source + relocator patch) + x87sidecar, no GameToMac; flat 60 on M1 Pro 16 GB and M5 Air, memory stays at 4.5–5.5 GB |
+| Age of Empires IV | **release candidate v0.1** | [`games/aoe4`](games/aoe4/) → https://github.com/NerRobDog/dxmt-aoe4-pack | own Wine engine (LGPL source + relocator patch) + x87sidecar; flat 60 on M1 Pro 16 GB and M5 Air, memory stays at 4.5–5.5 GB |
 | Overwatch 2 | playable | [`games/ow2`](games/ow2/) → _(repo not published yet)_ | DXMT fork `ir-release`: shader-IR release patch takes the game from 13 GB to ~4 GB resident, swap gone |
 | Magicka | work in progress | [`games/magicka`](games/magicka/) → _(repo not published yet)_ | FNA port (native, no Wine); tutorial playable, shadows and M5 testing open |
 | Prime World | work in progress | [`games/prime-world`](games/prime-world/) → _(repo not published yet)_ | offline 5v5 vs bots plays (first time on a Mac at all); CI Release build, 99 % of time in x87 → SSE2 rebuild pending |
@@ -79,7 +79,7 @@ that actually run the games are under their own licenses, unchanged:
 | Component | License | Source |
 |---|---|---|
 | DXMT fork (`components/dxmt`) | LGPL | https://github.com/NerRobDog/dxmt |
-| Wine engine for AoE IV (`components/wine-aoe4`) | LGPL 2.1 | CrossOver 26.3 / Wine 11.0 tree with Marc Ibrahim's Rosetta patch (published with GameToMac 0.1.5-alpha) + our relocator diff — https://github.com/NerRobDog/wine-aoe4 |
+| Wine engine for AoE IV (`components/wine-aoe4`) | LGPL 2.1 | CrossOver 26.3 / Wine 11.0 tree with Marc Ibrahim's Rosetta patch + our relocator diff — https://github.com/NerRobDog/wine-aoe4 |
 | x87sidecar (`components/x87sidecar`) | MIT | fork of Lifeisawful/rosettax87_jit by athei — https://github.com/NerRobDog/x87sidecar |
 
 Details in [`components/README.md`](components/README.md). No game files, no
