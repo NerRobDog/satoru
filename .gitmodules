@@ -11,3 +11,9 @@
 	path = components/dxmt
 	url = https://github.com/NerRobDog/dxmt
 	branch = aoe4-d3d12
+[submodule "games/ow2"]
+	path = games/ow2
+	url = https://github.com/NerRobDog/dxmt-ow2-pack
+[submodule "games/magicka"]
+	path = games/magicka
+	url = https://github.com/NerRobDog/magicka-fna

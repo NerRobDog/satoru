@@ -8,14 +8,15 @@ find it.
 | Directory | Submodule | State |
 |---|---|---|
 | `aoe4/` | dxmt-aoe4-pack — https://github.com/NerRobDog/dxmt-aoe4-pack | release candidate v0.1; the pack has its own `README.md`, `INSTALL.md`, `setup.sh`, `aoe4.sh` |
-| `ow2/` | _(repo not published yet)_ | stub: notes + reference `dxmt.conf`, no setup script yet |
-| `magicka/` | _(repo not published yet)_ | stub: FNA port in progress |
+| `ow2/` | dxmt-ow2-pack — https://github.com/NerRobDog/dxmt-ow2-pack | reference `dxmt.conf`, `install-dxmt.sh` into a CrossOver bottle, measurement scripts. No release and no engine of its own yet, so the launcher keeps it at SOON |
+| `magicka/` | magicka-fna — https://github.com/NerRobDog/magicka-fna | the FNA port itself: XNA 3.1 bridge, twins, relinker, launcher. Setup is still by hand (`tools/prepare.sh` against your own Steam install) |
 | `prime-world/` | _(repo not published yet)_ | stub: CI build, offline matches |
 
-`games/aoe4` is the `dxmt-aoe4-pack` submodule (its `game.toml` lives in that repo;
-`Setup` runs its `bootstrap.sh`, which downloads and verifies the release archive). The
-other directories hold only a `README.md` and a `game.toml` until their packs exist; the
-launcher marks their actions SOON rather than pretending.
+`aoe4/`, `ow2/` and `magicka/` are submodules, and each carries its own `game.toml` — the
+umbrella adds no file inside them. `aoe4`'s `Setup` runs its `bootstrap.sh`, which downloads
+and verifies the release archive; `ow2` and `magicka` declare no commands yet and the launcher
+marks their actions SOON rather than pretending. `prime-world/` still holds only a `README.md`
+and a `game.toml` until its repository exists.
 
 ## `game.toml`
 

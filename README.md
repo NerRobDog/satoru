@@ -27,8 +27,8 @@ carry the hashes.
 | Game | Status | Where | Notes |
 |---|---|---|---|
 | Age of Empires IV | **v0.1 released** | [`games/aoe4`](games/aoe4/) → https://github.com/NerRobDog/dxmt-aoe4-pack · [release v0.1](https://github.com/NerRobDog/dxmt-aoe4-pack/releases/tag/v0.1) | own Wine engine (LGPL source + relocator patch) + x87sidecar; flat 60 on M1 Pro 16 GB and M5 Air, memory stays at 4.5–5.5 GB |
-| Overwatch 2 | playable | [`games/ow2`](games/ow2/) → _(repo not published yet)_ | DXMT fork `ir-release`: shader-IR release patch takes the game from 13 GB to ~4 GB resident, swap gone |
-| Magicka | work in progress | [`games/magicka`](games/magicka/) → _(repo not published yet)_ | FNA port (native, no Wine); tutorial playable, shadows and M5 testing open |
+| Overwatch 2 | playable | [`games/ow2`](games/ow2/) → https://github.com/NerRobDog/dxmt-ow2-pack | DXMT fork `ir-release`: shader-IR release takes the game from 13 GB to 3.8 GB resident, swap gone; flat 60 by Metal pacing. Bottle-based install, no engine of its own yet |
+| Magicka | work in progress | [`games/magicka`](games/magicka/) → https://github.com/NerRobDog/magicka-fna | FNA port (native, no Wine, no Rosetta); tutorial plays with effects, lighting and voices; binary shadow format and M5 testing open |
 | Prime World | work in progress | [`games/prime-world`](games/prime-world/) → _(repo not published yet)_ | offline 5v5 vs bots plays (first time on a Mac at all); CI Release build, 99 % of time in x87 → SSE2 rebuild pending |
 
 Status vocabulary (also used by `game.toml`): `rc` = release candidate, pack
@@ -44,8 +44,8 @@ satoru/
   LICENSE            MIT — for the umbrella and the launcher only (see below)
   games/             one directory per game; each is a git submodule
     aoe4/            dxmt-aoe4-pack (standalone, has its own README/INSTALL)
-    ow2/             Overwatch 2 notes and config (stub for now)
-    magicka/         Magicka FNA port (stub for now)
+    ow2/             dxmt-ow2-pack (config, bottle installer, measurement scripts)
+    magicka/         magicka-fna (the FNA port: bridge, twins, relinker, launcher)
     prime-world/     Prime World (stub for now)
   components/        the shared pieces: dxmt, wine-aoe4, x87sidecar
   launcher/          satoru.py — the TUI, Python 3 stdlib only
