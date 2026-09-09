@@ -12,9 +12,10 @@ find it.
 | `magicka/` | _(repo not published yet)_ | stub: FNA port in progress |
 | `prime-world/` | _(repo not published yet)_ | stub: CI build, offline matches |
 
-Until the submodules are wired (`git submodule add <url> games/aoe4`), the
-directories hold only a `README.md` and a `game.toml`; the launcher reports the
-setup script as missing rather than pretending.
+`games/aoe4` is the `dxmt-aoe4-pack` submodule (its `game.toml` lives in that repo;
+`Setup` runs its `bootstrap.sh`, which downloads and verifies the release archive). The
+other directories hold only a `README.md` and a `game.toml` until their packs exist; the
+launcher marks their actions SOON rather than pretending.
 
 ## `game.toml`
 

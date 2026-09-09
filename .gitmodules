@@ -7,3 +7,7 @@
 [submodule "components/x87sidecar"]
 	path = components/x87sidecar
 	url = https://github.com/NerRobDog/x87sidecar
+[submodule "components/dxmt"]
+	path = components/dxmt
+	url = https://github.com/NerRobDog/dxmt
+	branch = aoe4-d3d12

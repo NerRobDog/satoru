@@ -8,7 +8,7 @@ exact commit and the hashes of what shipped.
 |---|---|---|---|
 | `dxmt/` | Our fork of DXMT: D3D11 and the experimental D3D12 layer → Metal. Branches: `main` (OW2, `ir-release` merged — shader-IR release), `aoe4-d3d12` (the D3D12 fixes for AoE IV, CPU-side pacing, per-frame CSV log, disk shader cache). The fork keeps the upstream name; nothing goes to upstream from here. | LGPL | https://github.com/NerRobDog/dxmt |
 | `wine-aoe4/` | Wine engine for Age of Empires IV: CrossOver 26.3 / Wine 11.0 source carrying Marc Ibrahim's Rosetta patch (in-process delivery of the anti-tamper's invalid-opcode exceptions and a fixed cache for the code fragments it continues into), plus our relocator extension (near conditional branches `0F 8x rel32` leaving a fragment are relocated too). Built by us, from source, with the x86_64 deps it needs (freetype, gnutls, inotify, …). | LGPL 2.1 | https://github.com/NerRobDog/wine-aoe4; our diff: `wine-aoe-patch-relocator.diff` in the AoE IV pack |
-| `x87sidecar/` | Helper that attaches to the game process and hooks Rosetta's decoder there (softfault decoder hook). Per-process only: no SIP change, no root, nothing system-wide. Fork of Lifeisawful/rosettax87_jit by athei, built by us from the MIT source. | MIT | `<SIDECAR-SOURCE-REPO-LINK>` |
+| `x87sidecar/` | Helper that attaches to the game process and hooks Rosetta's decoder there (softfault decoder hook). Per-process only: no SIP change, no root, nothing system-wide. Fork of Lifeisawful/rosettax87_jit by athei, built by us from the MIT source. | MIT | https://github.com/NerRobDog/x87sidecar |
 
 Build consistency rules we hold ourselves to (from the project's working
 agreement):
