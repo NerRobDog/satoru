@@ -481,6 +481,89 @@ def command_target(cmd):
     return resolve(words[0])
 
 
+# ----------------------------------------------------------------------------
+# where things go
+
+class Paths(object):
+    """The layout, in one place, so that no other code has to guess.
+
+    Bodies live where Steam and CrossOver keep theirs; logs where Console.app
+    looks; caches where the system already knows they are disposable; bundles
+    where Spotlight indexes them without asking for admin rights.
+    """
+
+    def __init__(self, home=None, root=None):
+        self.home = home or os.path.expanduser("~")
+        lib = os.path.join(self.home, "Library")
+        self.support = os.path.join(lib, "Application Support", "satoru")
+        self.caches = os.path.join(lib, "Caches", "satoru")
+        self.logs = os.path.join(lib, "Logs", "satoru")
+        self.applications = os.path.join(self.home, "Applications", "satoru")
+        self.config_file = os.path.join(self.support, "config.toml")
+        self.installed_file = os.path.join(self.support, "installed.toml")
+        # `root` moves the gigabytes and nothing else: whoever moves them is
+        # moving them to another disk, and a log Console.app cannot find is
+        # not a log.
+        self.root = expand(root) if root else self.support
+
+    @staticmethod
+    def _checked(game_id):
+        """An id arrives in a manifest, and a manifest arrives off the internet."""
+        if not game_id or not _ID_OK.match(str(game_id)):
+            raise ValueError(
+                "%r is not a usable game id (lower-case letters, digits and dashes)"
+                % (game_id,))
+        return game_id
+
+    def game_home(self, game_id):
+        return os.path.join(self.root, self._checked(game_id))
+
+    def game_cache(self, game_id):
+        return os.path.join(self.caches, self._checked(game_id))
+
+    def game_logs(self, game_id):
+        return os.path.join(self.logs, self._checked(game_id))
+
+    def bundle(self, name):
+        return os.path.join(self.applications, _bundle_filename(name))
+
+
+def _bundle_filename(name):
+    """A display name is not a filename.
+
+    "/" cannot appear in one at all, and ":" is a separator to the classic Mac
+    APIs - Finder renders it back as "/", which is how a game called "A:B" ends
+    up looking like a directory.
+    """
+    clean = str(name).replace("/", "-").replace(":", "-").strip().lstrip(".")
+    clean = "".join(ch for ch in clean if ch >= " ")
+    return (clean or "untitled") + ".app"
+
+
+CONFIG_KEYS = ("root", "check_updates")
+
+
+def load_config(path):
+    """Never fails: a missing or broken config gives defaults and says what it saw."""
+    cfg = {"root": None, "check_updates": True, "warnings": []}
+    try:
+        data = load_toml(path)
+    except (IOError, OSError):
+        return cfg
+    except ValueError as exc:
+        cfg["warnings"].append("%s: %s" % (path, exc))
+        return cfg
+    for key, value in data.items():
+        if key not in CONFIG_KEYS:
+            cfg["warnings"].append("%s: unknown key %r" % (path, key))
+            continue
+        cfg[key] = value
+    if not isinstance(cfg["check_updates"], bool):
+        cfg["warnings"].append("%s: check_updates must be true or false" % path)
+        cfg["check_updates"] = True
+    return cfg
+
+
 class Game(object):
     def __init__(self, path, data):
         g = data.get("game", {})
