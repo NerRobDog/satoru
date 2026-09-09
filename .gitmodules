@@ -1,0 +1,9 @@
+[submodule "games/aoe4"]
+	path = games/aoe4
+	url = https://github.com/NerRobDog/dxmt-aoe4-pack
+[submodule "components/wine-aoe4"]
+	path = components/wine-aoe4
+	url = https://github.com/NerRobDog/wine-aoe4
+[submodule "components/x87sidecar"]
+	path = components/x87sidecar
+	url = https://github.com/NerRobDog/x87sidecar
