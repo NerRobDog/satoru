@@ -12,11 +12,12 @@ cd "$HERE"
 
 found=0
 failed=0
+seen=""
 for py in python3 /usr/bin/python3 python3.11 python3.12 python3.13; do
     command -v "$py" > /dev/null 2>&1 || continue
     ver=$("$py" --version 2>&1)
     case " $seen " in *" $ver "*) continue ;; esac
-    seen="${seen:-} $ver"
+    seen="$seen $ver"
     found=$((found + 1))
     out=$("$py" -m unittest discover -s . -p 'test_*.py' 2>&1)
     if [ $? -eq 0 ]; then
