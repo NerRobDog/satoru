@@ -9,6 +9,7 @@ do nothing; actions whose script is not on disk say "missing".
     python3 launcher/satoru.py            # TUI
     python3 launcher/satoru.py --list     # plain listing (no curses)
     python3 launcher/satoru.py --check    # validate every game.toml, exit 1 on error
+    python3 launcher/satoru.py --version  # what this build is, and which packs it knows
 """
 import os
 import shlex
@@ -17,6 +18,43 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GAMES_DIR = os.path.join(ROOT, "games")
+
+
+def version():
+    """Release tarballs carry a VERSION file; a git checkout usually does not."""
+    try:
+        with open(os.path.join(ROOT, "VERSION"), encoding="utf-8") as fh:
+            return fh.read().strip() or "unreleased"
+    except OSError:
+        return "git checkout"
+
+
+# What an empty games/ means, and both ways out of it. A plain `git clone` leaves the
+# submodules as empty directories, and the launcher used to answer that by listing
+# nothing at all -- which reads as "this project is empty", not as "you are missing a step".
+def unchecked_packs(games_dir=GAMES_DIR):
+    """games/<id>/ directories that are empty: submodules nobody checked out."""
+    out = []
+    if not os.path.isdir(games_dir):
+        return out
+    for entry in sorted(os.listdir(games_dir)):
+        d = os.path.join(games_dir, entry)
+        if os.path.isdir(d) and not os.listdir(d):
+            out.append(entry)
+    return out
+
+
+NO_GAMES_HINT = (
+    "No games found under %s.\n"
+    "\n"
+    "If you cloned the repository, the packs are submodules and are not there yet:\n"
+    "    git submodule update --init --recursive\n"
+    "(that pulls ~400 MB, most of it the Wine source tree in components/wine-aoe4)\n"
+    "\n"
+    "To only run games, the release tarball carries the launcher and the packs'\n"
+    "metadata and weighs ~130 KB:\n"
+    "    https://github.com/NerRobDog/satoru/releases\n"
+)
 
 STATUSES = ("rc", "playable", "wip")
 STATUS_LABEL = {"rc": "release candidate", "playable": "playable", "wip": "work in progress"}
@@ -229,6 +267,15 @@ def run_action(game, key):
 # plain mode
 
 def describe(games, out=sys.stdout):
+    if not games:
+        out.write(NO_GAMES_HINT % GAMES_DIR)
+        return
+    absent = unchecked_packs()
+    if absent:
+        out.write("Not listed: %s — submodule%s not checked out.\n"
+                  "Run `git submodule update --init --recursive`, or take the release\n"
+                  "tarball, which needs no clone: https://github.com/NerRobDog/satoru/releases\n\n"
+                  % (", ".join(absent), "" if len(absent) == 1 else "s"))
     for g in games:
         out.write("%s [%s] — %s\n" % (g.name, g.id, STATUS_LABEL.get(g.status, g.status)))
         for key, label, _ in ACTIONS:
@@ -256,7 +303,12 @@ def check(games_dir=GAMES_DIR, out=sys.stdout):
             continue
         p = os.path.join(d, "game.toml")
         if not os.path.isfile(p):
-            out.write("games/%s: no game.toml (skipped)\n" % entry)
+            empty = not os.listdir(d)
+            out.write("games/%s: no game.toml — %s\n" % (
+                entry,
+                "submodule not checked out (git submodule update --init)" if empty
+                else "the pack does not declare one"))
+            ok = False if empty else ok
             continue
         try:
             g = Game(p, load_toml(p))
@@ -306,11 +358,18 @@ def tui(stdscr, games):
     def draw():
         stdscr.erase()
         h, w = stdscr.getmaxyx()
-        put(0, 1, "satoru — Windows games on Apple Silicon, open builds", curses.A_BOLD)
+        put(0, 1, "satoru %s — Windows games on Apple Silicon, open builds" % version(),
+            curses.A_BOLD)
         put(1, 1, "↑/↓ or j/k move · Enter actions · Esc back · q quit")
+        absent = unchecked_packs()
+        if absent and games:
+            put(2, 1, "not listed: %s — submodules not checked out (git submodule update --init)"
+                % ", ".join(absent), curses.A_DIM)
         y = 3
         if not games:
-            put(y, 3, "no games/*/game.toml found under %s" % GAMES_DIR)
+            for line in (NO_GAMES_HINT % GAMES_DIR).splitlines():
+                put(y, 3, line)
+                y += 1
         for i, g in enumerate(games):
             attr = curses.A_REVERSE if (i == sel and mode == "games") else 0
             put(y, 1, "%s %-24s" % (">" if i == sel else " ", g.name), attr)
@@ -393,13 +452,18 @@ def tui(stdscr, games):
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    if "--version" in argv:
+        sys.stdout.write("satoru %s\n" % version())
+        for g in load_games():
+            sys.stdout.write("  %-12s %s\n" % (g.id, STATUS_LABEL.get(g.status, g.status)))
+        return 0
     if "--check" in argv:
         return 0 if check() else 1
     games = load_games()
     if "--list" in argv:
         describe(games)
         return 0
-    if argv and argv[0] not in ("--list", "--check"):
+    if argv and argv[0] not in ("--list", "--check", "--version"):
         sys.stderr.write(__doc__)
         return 2
     import curses

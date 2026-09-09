@@ -9,6 +9,34 @@ No closed binaries, no app-store wrapper, no subscription. Every DLL and engine
 in a release is built from a commit you can check out, and the release notes
 carry the hashes.
 
+## Get it
+
+Two commands, no clone:
+
+```
+curl -LO https://github.com/NerRobDog/satoru/releases/download/v0.1/satoru-v0.1.tar.gz
+tar xzf satoru-v0.1.tar.gz && ./satoru-v0.1/satoru.command
+```
+
+That archive is about 130 KB — the launcher and the packs' metadata, nothing else. Its
+sha256 is in the release notes, and `shasum -c SHA256SUMS` inside the folder checks every
+file. Choosing **Setup** for a game downloads that game's pack, verifies its hashes and runs
+the pack's own installer.
+
+In Finder a downloaded `.command` needs right-click → Open the first time (macOS quarantines
+it); from Terminal it just runs. `python3 launcher/satoru.py` is the same entry point — if
+macOS offers to install the Command Line Tools, accept, that is where `python3` comes from.
+
+**Cloning is for working on satoru**, not for playing:
+
+```
+git clone --recurse-submodules https://github.com/NerRobDog/satoru
+```
+
+Without `--recurse-submodules` the packs are empty directories and the launcher lists none
+of them (it says so, and `--check` exits 1). With them it is ~410 MB, most of it the Wine
+source tree in `components/wine-aoe4` — which the launcher never reads.
+
 ## Philosophy
 
 - **Open.** Sources for everything that runs: the DXMT fork, the Wine tree and
@@ -39,6 +67,7 @@ hand-driven; `wip` = not for users yet.
 
 ```
 satoru/
+  satoru.command     entry point (double-click, or run it)
   README.md          this file
   DONATE.md          how to support the work
   LICENSE            MIT — for the umbrella and the launcher only (see below)
@@ -49,6 +78,7 @@ satoru/
     prime-world/     Prime World (stub for now)
   components/        the shared pieces: dxmt, wine-aoe4, x87sidecar
   launcher/          satoru.py — the TUI, Python 3 stdlib only
+  tools/             make-release.sh — builds the ~130 KB release tarball
 ```
 
 Each `games/<id>/game.toml` tells the launcher what the game is called, how
@@ -58,9 +88,11 @@ far along it is, and which commands set it up and start it. Format in
 ## Launcher
 
 ```
-python3 launcher/satoru.py            # TUI (curses)
+./satoru.command                      # TUI (curses)
+python3 launcher/satoru.py            # the same, spelled out
 python3 launcher/satoru.py --list     # plain listing, no terminal UI
-python3 launcher/satoru.py --check    # validate every games/*/game.toml
+python3 launcher/satoru.py --check    # validate every games/*/game.toml, exit 1 on error
+python3 launcher/satoru.py --version  # this build, and the packs it knows
 ```
 
 Arrow keys or `j`/`k` pick a game, `Enter` opens its actions (Setup, Launch,
