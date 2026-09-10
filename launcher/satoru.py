@@ -364,6 +364,18 @@ def parse_manifest(data):
 # ----------------------------------------------------------------------------
 # [requires]: what the machine has to be before a pack is worth downloading
 
+
+def _nearest_existing(path):
+    """The closest ancestor of `path` that is actually there, `/` at worst."""
+    path = os.path.abspath(path)
+    while not os.path.exists(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    return path
+
+
 class SystemProbe(object):
     """Everything the checks want to know about this Mac, in one injectable place.
 
@@ -403,7 +415,14 @@ class SystemProbe(object):
             return False
 
     def free_gb(self, path=None):
-        st = os.statvfs(path or os.path.expanduser("~"))
+        """Free space on the volume that would hold `path`.
+
+        The first install asks about directories nothing has created yet, and
+        statvfs raises on a path that is not there. The question is about a
+        volume, and the volume exists whether or not the directory does, so walk
+        up until something answers.
+        """
+        st = os.statvfs(_nearest_existing(path or os.path.expanduser("~")))
         return st.f_bavail * st.f_frsize / float(1024 ** 3)
 
     def which(self, tool):
@@ -675,22 +694,36 @@ def _remove(path):
         pass
 
 
-def _member_stays_inside(member, dest):
+def _inside(root, path):
+    return path == root or path.startswith(root + os.sep)
+
+
+def _member_stays_inside(member, dest, root):
     """Every path an archive gives us is data from the internet.
 
-    A member called ../../etc/passwd, an absolute name, or a symlink pointing out
-    of the tree are all attacks rather than files, and tarfile will happily follow
-    them if nobody checks.
+    Two things here are not obvious, and both were wrong when this was a pass
+    over the member list before anything was written.
+
+    A member's own name is resolved against the destination *as it stands*, so a
+    symlink an earlier member planted is followed the way tar itself will follow
+    it. Reading the whole list first cannot see that: `up -> .` looks harmless,
+    and `up/../../evil` then resolves through it to the destination's parent.
+
+    A symlink's target is resolved against the link's own directory, because
+    that is where the system will resolve it. Joining it to the destination root
+    instead calls every ../.. inside a Wine tree or a dylib layout an attack. A
+    hardlink is the other way round: its target names another member, so it is
+    relative to the root.
     """
-    root = os.path.realpath(dest)
-    for name in (member.name, member.linkname or ""):
-        if not name:
-            continue
-        if os.path.isabs(name):
-            return False
-        full = os.path.realpath(os.path.join(root, name))
-        if full != root and not full.startswith(root + os.sep):
-            return False
+    if os.path.isabs(member.name) or os.path.isabs(member.linkname or ""):
+        return False
+    if not _inside(root, os.path.realpath(os.path.join(dest, member.name))):
+        return False
+    if member.issym():
+        base = os.path.dirname(os.path.join(dest, member.name))
+        return _inside(root, os.path.realpath(os.path.join(base, member.linkname)))
+    if member.islnk():
+        return _inside(root, os.path.realpath(os.path.join(dest, member.linkname)))
     return True
 
 
@@ -703,18 +736,40 @@ def unpack(archive, dest):
     if os.path.exists(dest):
         shutil.rmtree(dest)
     os.makedirs(dest)
+    root = os.path.realpath(dest)
     try:
         with contextlib.closing(tarfile.open(archive, "r:*")) as tf:
             members = tf.getmembers()
+            # Python's filter quietly makes an absolute name relative, the way
+            # GNU tar does. Safe, but a pack that ships one is broken and should
+            # hear about it rather than be silently rewritten.
             for member in members:
-                if not _member_stays_inside(member, dest):
+                if os.path.isabs(member.name) or os.path.isabs(member.linkname or ""):
                     raise PackError(
-                        "the archive contains %r, which points outside the "
-                        "directory it is being unpacked into" % (member.name,))
-            if sys.version_info >= (3, 12):
-                tf.extractall(dest, filter="tar")
+                        "the archive contains %r, an absolute path, which no pack "
+                        "has any reason to ship" % (member.name,))
+            if hasattr(tarfile, "data_filter"):
+                # Python's own check, and it looks at the disk rather than at the
+                # member list, which is what makes it see a symlink planted by an
+                # earlier member. It also strips setuid bits and refuses device
+                # nodes - neither of which an archive off the internet has any
+                # business carrying. Present from 3.12, and backported to
+                # 3.8.17, 3.9.17, 3.10.12 and 3.11.4.
+                tf.extractall(dest, members=members, filter="data")
             else:
-                tf.extractall(dest)
+                # The 3.9.6 that ships with the command line tools has no filter,
+                # so each member is checked against the destination at the moment
+                # it is written, not against a list read beforehand.
+                for member in members:
+                    if member.isdev():
+                        raise PackError(
+                            "the archive contains a device node, %r, which no "
+                            "pack has any reason to ship" % (member.name,))
+                    if not _member_stays_inside(member, dest, root):
+                        raise PackError(
+                            "the archive contains %r, which points outside the "
+                            "directory it is being unpacked into" % (member.name,))
+                    tf.extract(member, dest)
     except PackError:
         shutil.rmtree(dest, ignore_errors=True)
         raise
@@ -957,8 +1012,12 @@ def install_game(manifest, paths, probe=None, runner=None, fetch=None, unpack=No
     name, game_id = game["name"], game["id"]
     commands = manifest["commands"] or {}
 
+    # The volume the bytes land on is the bundle's, not the library's: per
+    # ADR-0001 the pack installs into the home inside the .app, and the library
+    # is only where a game's own files go. Measuring the library reports a
+    # roomy external disk while the engine fills the internal one.
     requirements = check_requirements(manifest["requires"], probe=probe,
-                                      root=paths.library)
+                                      root=paths.home(name))
     if not all_met(requirements):
         unmet = [r for r in requirements if not r["ok"]]
         return _install_result(False, "requirements", reason="requirements",

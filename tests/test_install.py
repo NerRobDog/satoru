@@ -131,6 +131,27 @@ class Order(Harness):
             os.path.join(self.paths.home("Age of Empires IV"), "launch")))
 
 
+class WhichVolumeIsMeasured(Harness):
+    def test_the_disk_check_asks_about_the_volume_the_bytes_land_on(self):
+        """Per ADR-0001 the pack installs into the bundle, not into the library.
+
+        With a library moved to an external disk, measuring the library reports
+        six terabytes free while the engine goes onto a full internal one.
+        """
+        asked = []
+
+        class RecordingProbe(FakeProbe):
+            def free_gb(self, path=None):
+                asked.append(path)
+                return FakeProbe.free_gb(self, path)
+
+        self.install(probe=RecordingProbe())
+        self.assertTrue(asked, "nothing asked about free space at all")
+        self.assertTrue(asked[0].startswith(self.paths.applications),
+                        "measured %r, but the pack writes under %r"
+                        % (asked[0], self.paths.applications))
+
+
 class Refusals(Harness):
     def test_an_unmet_requirement_stops_before_a_single_byte_is_downloaded(self):
         result, runner = self.install(probe=FakeProbe(rosetta=False))

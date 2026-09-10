@@ -10,6 +10,7 @@ and must never offer an action that does not exist:
   fix = {"kind": "manual"}  only you can, here is how
   fix = None                nobody can
 """
+import os
 import unittest
 
 from support import satoru
@@ -146,6 +147,27 @@ class RealMachine(unittest.TestCase):
         self.assertGreater(p.free_gb("/"), 0)
         self.assertTrue(p.which("sh"))
         self.assertIsNone(p.which("definitely-not-a-real-binary-xyzzy"))
+
+    def test_free_space_can_be_read_before_the_directory_exists(self):
+        """The first install asks about a library nothing has created yet.
+
+        statvfs on a path that is not there raises, and the raise came out of
+        install_game as a traceback across the TUI - on the one flow that has to
+        work on a clean machine. The question is about a volume, and the volume
+        is there whether or not the directory is.
+        """
+        import tempfile
+        missing = os.path.join(tempfile.mkdtemp(), "Library", "Application Support",
+                               "satoru", "library")
+        self.assertGreater(satoru.SystemProbe().free_gb(missing), 0)
+
+    def test_a_disk_requirement_survives_a_directory_that_is_not_there(self):
+        import tempfile
+        missing = os.path.join(tempfile.mkdtemp(), "not", "made", "yet")
+        result = by_id(satoru.check_requirements({"disk_gb": 4},
+                                                 probe=satoru.SystemProbe(),
+                                                 root=missing), "disk")
+        self.assertIsNotNone(result)
 
 
 if __name__ == "__main__":

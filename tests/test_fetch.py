@@ -153,6 +153,53 @@ class Unpack(unittest.TestCase):
         self.assertRaises(satoru.PackError, satoru.unpack, path,
                           os.path.join(self.dir, "out"))
 
+    def test_a_symlink_an_earlier_member_planted_cannot_be_walked_through(self):
+        """The shape a pass over the member list cannot see.
+
+        `up -> .` is harmless read on its own, so a lexical check accepts it;
+        then `up/../../evil.txt` resolves *through* it and lands one directory
+        above the destination. Nothing on disk is consulted while the list is
+        read, so nothing notices. On 3.12+ Python's own filter refuses it; on
+        the 3.9 that ships with the command line tools this check was the only
+        thing in the way, and it let the file through.
+        """
+        import io
+        path = os.path.join(self.dir, "traverse.tar.gz")
+        with tarfile.open(path, "w:gz") as tf:
+            link = tarfile.TarInfo("pack/up")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "."
+            tf.addfile(link)
+            data = b"owned"
+            info = tarfile.TarInfo("pack/up/../../evil.txt")
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+        out = os.path.join(self.dir, "out", "unpacked")
+        victim = os.path.join(self.dir, "out", "evil.txt")
+        self.assertRaises(satoru.PackError, satoru.unpack, path, out)
+        self.assertFalse(os.path.exists(victim), "the archive escaped its destination")
+
+    def test_a_relative_symlink_inside_the_pack_is_kept(self):
+        """Wine trees and dylib layouts are made of these.
+
+        The installed pack on a real machine has prefix/dosdevices/c: -> ../drive_c.
+        Resolving a linkname against the destination root instead of the link's
+        own directory called every one of them an attack and refused the pack.
+        """
+        import io
+        path = os.path.join(self.dir, "relative.tar.gz")
+        with tarfile.open(path, "w:gz") as tf:
+            real = tarfile.TarInfo("pack/Engine/lib/real.so")
+            real.size = 0
+            tf.addfile(real, io.BytesIO(b""))
+            link = tarfile.TarInfo("pack/Engine/lib/wine/x/link.so")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "../../real.so"
+            tf.addfile(link)
+        root = satoru.unpack(path, os.path.join(self.dir, "out3"))
+        self.assertTrue(os.path.islink(
+            os.path.join(root, "Engine", "lib", "wine", "x", "link.so")))
+
     def test_apple_double_files_do_not_hide_the_packs_root(self):
         """A tarball built on macOS carries `._name` siblings whenever the files
         had extended attributes, and our own releases are built on macOS. Counting
