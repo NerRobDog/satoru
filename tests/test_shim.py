@@ -17,6 +17,7 @@ Three things it must get right, in this order:
      the answer is read on some later run.
 """
 import os
+import shlex
 import shutil
 import stat
 import tempfile
@@ -72,6 +73,15 @@ class Shape(unittest.TestCase):
 
     def test_the_shader_cache_points_inside_the_home(self):
         self.assertIn(self.paths.shader_cache("Age of Empires IV"), self.text)
+
+    def test_the_shader_cache_directory_is_made_before_the_game_is_told_about_it(self):
+        """Nothing else creates it. DXMT is handed an absolute path and opens a
+        file in it; a missing directory costs the warmed pipelines silently,
+        which is the one failure this cache exists to prevent.
+        """
+        made = index_of(self.text, "mkdir -p " + shlex.quote(
+            self.paths.shader_cache("Age of Empires IV")))
+        self.assertLess(made, index_of(self.text, "exec "))
 
     def test_the_update_check_is_detached_and_not_waited_for(self):
         check = index_of(self.text, "update-check")

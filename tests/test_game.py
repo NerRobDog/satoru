@@ -88,17 +88,22 @@ class V1Installable(unittest.TestCase):
         self.gamedir = os.path.join(self.dir, "aoe4")
         os.makedirs(self.gamedir)
         self.game = game_from(V1_INSTALLABLE, self.gamedir)
+        # Its own empty world. Without this the answer comes from whatever the
+        # machine running the tests happens to have installed, and the suite
+        # passes or fails on that — which it did, the first time a real install
+        # landed on the developer's own disk.
+        self.paths = satoru.Paths(home=os.path.join(self.dir, "home"))
 
     def tearDown(self):
         shutil.rmtree(self.dir, ignore_errors=True)
 
     def test_setup_is_offered_because_the_umbrella_can_install_it(self):
-        state, detail = self.game.action_state("setup")
+        state, detail = self.game.action_state("setup", self.paths)
         self.assertEqual(state, "ok")
         self.assertIn("v0.1", detail)
 
     def test_launch_waits_until_something_is_installed(self):
-        state, _ = self.game.action_state("launch")
+        state, _ = self.game.action_state("launch", self.paths)
         self.assertEqual(state, "missing",
                          "nothing is installed yet, so Launch cannot claim to work")
 
@@ -121,7 +126,8 @@ class V1Manual(unittest.TestCase):
                          "https://github.com/NerRobDog/dxmt-ow2-pack#install")
 
     def test_setup_is_not_offered_and_that_is_not_an_error(self):
-        state, _ = self.game.action_state("setup")
+        state, _ = self.game.action_state("setup", satoru.Paths(
+            home=os.path.join(self.dir, "home")))
         self.assertEqual(state, "soon")
         self.assertEqual(self.game.validate(), [],
                          "declaring an honest manual install is not a broken manifest")
