@@ -11,6 +11,7 @@ do nothing; actions whose script is not on disk say "missing".
     python3 launcher/satoru.py --check    # validate every game.toml, exit 1 on error
     python3 launcher/satoru.py --version  # what this build is, and which packs it knows
 """
+import datetime
 import os
 import platform
 import re
@@ -76,11 +77,33 @@ ACTIONS = (
 # TOML: tomllib on 3.11+, otherwise a minimal reader for the game.toml subset
 # ([section], key = "string" | 123 | true | false | """multi-line""", # comments)
 
+def _unescape(text):
+    """TOML basic-string escapes, in one pass.
+
+    A chain of .replace() calls cannot do this: unescaping \\" before \\\\ turns
+    a literal backslash-then-quote into a quote, and doing it the other way
+    round breaks the quote. One left-to-right pass is the only correct order.
+    """
+    out = []
+    i = 0
+    simple = {'"': '"', "\\": "\\", "n": "\n", "t": "\t", "r": "\r"}
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text):
+            nxt = text[i + 1]
+            out.append(simple.get(nxt, "\\" + nxt))
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _parse_scalar(val, lineno):
     """A bare value: string, bool or integer. Everything else is an error, loudly."""
     val = val.strip()
     if val.startswith('"') and val.endswith('"') and len(val) >= 2:
-        return val[1:-1].replace('\\"', '"').replace("\\n", "\n")
+        return _unescape(val[1:-1])
     val = val.split("#", 1)[0].strip()
     if val == "true":
         return True
@@ -168,12 +191,21 @@ def _parse_minimal_toml(text):
             cur[key] = "\n".join(parts).lstrip("\n")
             continue
         if val.startswith('"'):
-            end = val.find('"', 1)
-            while end != -1 and val[end - 1] == "\\":
-                end = val.find('"', end + 1)
+            # Walk it rather than searching: a closing quote is one that is not
+            # itself escaped, and counting backslashes backwards gets that wrong
+            # for a string ending in a literal backslash.
+            end, j = -1, 1
+            while j < len(val):
+                if val[j] == "\\":
+                    j += 2
+                    continue
+                if val[j] == '"':
+                    end = j
+                    break
+                j += 1
             if end == -1:
                 raise ValueError("line %d: unterminated string" % i)
-            cur[key] = val[1:end].replace('\\"', '"').replace("\\n", "\n")
+            cur[key] = _unescape(val[1:end])
             continue
         if val.startswith("["):
             cur[key] = _parse_array(val, i)
@@ -453,6 +485,99 @@ def check_requirements(requires, probe=None, root=None):
 
 def all_met(results):
     return all(r["ok"] for r in results)
+
+
+# ----------------------------------------------------------------------------
+# installed.toml: what is installed, where, and of what version
+
+INSTALLED_KEYS = ("name", "version", "source_sha256", "installed_at", "home", "bundle")
+
+
+def _toml_string(value):
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def write_installed(path, entries):
+    """Rewrite the file from scratch, atomically.
+
+    Atomically because the alternative is a half-written state file, and a
+    launcher that cannot read its own state is worse than one with none.
+    """
+    lines = ["# satoru: what is installed. Written by satoru, not by packs.", ""]
+    for game_id in sorted(entries):
+        lines.append("[%s]" % game_id)
+        entry = entries[game_id]
+        for key in INSTALLED_KEYS:
+            if key in entry and entry[key] not in (None, ""):
+                lines.append("%s = %s" % (key, _toml_string(entry[key])))
+        lines.append("")
+    directory = os.path.dirname(path)
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines))
+    os.replace(tmp, path)
+
+
+def read_installed(path):
+    """Never raises. A missing or broken file means "nothing is installed"."""
+    try:
+        data = load_toml(path)
+    except (IOError, OSError):
+        return {}
+    except ValueError:
+        # Including tomllib's decode error, which is a ValueError. A state file
+        # someone hand-edited into nonsense should not take the launcher down.
+        return {}
+    return dict((k, v) for k, v in data.items() if isinstance(v, dict))
+
+
+def record_install(paths, manifest, source_sha256):
+    name = manifest["game"]["name"]
+    game_id = manifest["game"]["id"]
+    source = manifest.get("source") or {}
+    entries = read_installed(paths.installed_file)
+    entries[game_id] = {
+        "name": name,
+        "version": source.get("version") or "",
+        "source_sha256": source_sha256 or "",
+        "installed_at": datetime.datetime.now().replace(microsecond=0).isoformat(),
+        "home": paths.home(name),
+        "bundle": paths.bundle(name),
+    }
+    write_installed(paths.installed_file, entries)
+    return entries[game_id]
+
+
+def forget_install(paths, game_id):
+    entries = read_installed(paths.installed_file)
+    if entries.pop(game_id, None) is None:
+        return False
+    write_installed(paths.installed_file, entries)
+    return True
+
+
+def installed_entry(paths, game_id):
+    """The entry, or None if the home it names is gone.
+
+    installed.toml is a claim, not proof. Dragging a bundle to the Trash is a
+    normal thing for a person to do, and afterwards the launcher has to say the
+    game is not installed rather than offer to launch what is not there.
+    """
+    entry = read_installed(paths.installed_file).get(game_id)
+    if not entry:
+        return None
+    home = entry.get("home")
+    if not home or not os.path.isdir(home):
+        return None
+    return entry
+
+
+def installed_games(paths):
+    entries = read_installed(paths.installed_file)
+    return dict((gid, e) for gid, e in entries.items()
+                if e.get("home") and os.path.isdir(e["home"]))
 
 
 # ----------------------------------------------------------------------------
