@@ -372,7 +372,23 @@ class SystemProbe(object):
     """
 
     def arch(self):
-        return platform.machine()
+        """The machine's architecture, not this process's.
+
+        platform.machine() answers about the running process, and a process can
+        be translated: python3.11 from an Intel Homebrew prefix reports x86_64
+        on an M1 Pro, and every child it spawns inherits that. Asking it would
+        tell a perfectly good Apple Silicon Mac that it needs an Apple Silicon
+        Mac. hw.optional.arm64 is a property of the hardware and does not lie.
+        """
+        try:
+            with open(os.devnull, "wb") as null:
+                out = subprocess.check_output(
+                    ["sysctl", "-n", "hw.optional.arm64"], stderr=null)
+            if out.strip() == b"1":
+                return "arm64"
+            return "x86_64"
+        except (OSError, subprocess.CalledProcessError):
+            return platform.machine()
 
     def macos_version(self):
         return platform.mac_ver()[0]

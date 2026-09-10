@@ -121,6 +121,23 @@ class Versions(unittest.TestCase):
 class RealMachine(unittest.TestCase):
     """The default probe has to answer about the Mac it is running on."""
 
+    def test_arch_describes_the_machine_and_not_the_process(self):
+        """A translated interpreter must not make an M-series Mac look like Intel.
+
+        tests/run.sh runs the suite on every interpreter this Mac has, and some
+        of them are x86_64 binaries under Rosetta - which is exactly the case
+        this guards. On a native interpreter there is nothing to prove.
+        """
+        import platform
+        import subprocess
+        translated = subprocess.check_output(
+            ["sysctl", "-n", "sysctl.proc_translated"]).strip() == b"1"
+        if not translated:
+            self.skipTest("this interpreter is native, so the two answers agree anyway")
+        self.assertNotEqual(satoru.SystemProbe().arch(), platform.machine(),
+                            "arch() is reporting the process, not the machine")
+        self.assertEqual(satoru.SystemProbe().arch(), "arm64")
+
     def test_system_probe_answers(self):
         p = satoru.SystemProbe()
         self.assertTrue(p.arch())
