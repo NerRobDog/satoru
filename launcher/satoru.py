@@ -722,7 +722,12 @@ def unpack(archive, dest):
         shutil.rmtree(dest, ignore_errors=True)
         raise PackError("could not unpack %s: %s" % (archive, exc))
 
-    entries = os.listdir(dest)
+    # A tarball built on macOS carries an AppleDouble `._name` beside every entry
+    # whose file had extended attributes, and our own releases are built on macOS.
+    # Counting one of those as a second root left the pack's commands running a
+    # directory too high, where `bash setup.sh` is "No such file or directory".
+    entries = [e for e in os.listdir(dest)
+               if not e.startswith("._") and e != ".DS_Store"]
     if len(entries) == 1 and os.path.isdir(os.path.join(dest, entries[0])):
         return os.path.join(dest, entries[0])
     return dest

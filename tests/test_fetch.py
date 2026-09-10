@@ -105,6 +105,15 @@ class Unpack(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.dir, ignore_errors=True)
 
+    def _stage(self):
+        """A pack directory to build archives out of, with one file in it."""
+        stage = os.path.join(self.dir, "stage")
+        if not os.path.isdir(stage):
+            os.makedirs(stage)
+            with open(os.path.join(stage, "setup.sh"), "w") as fh:
+                fh.write("#!/bin/sh\n")
+        return stage
+
     def test_unpacks_into_the_destination(self):
         p = make_tarball(self.dir)
         dest = os.path.join(self.dir, "out")
@@ -143,6 +152,36 @@ class Unpack(unittest.TestCase):
             tf.addfile(info)
         self.assertRaises(satoru.PackError, satoru.unpack, path,
                           os.path.join(self.dir, "out"))
+
+    def test_apple_double_files_do_not_hide_the_packs_root(self):
+        """A tarball built on macOS carries `._name` siblings whenever the files
+        had extended attributes, and our own releases are built on macOS. Counting
+        those as a second top-level entry left every pack command running one
+        directory too high, where `bash setup.sh` is `No such file or directory`.
+        """
+        import io
+        path = os.path.join(self.dir, "appledouble.tar.gz")
+        with tarfile.open(path, "w:gz") as tf:
+            tf.add(self._stage(), arcname="pack")
+            for junk in ("._pack", ".DS_Store"):
+                info = tarfile.TarInfo(junk)
+                data = b"\x00\x05\x16\x07"
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+        root = satoru.unpack(path, os.path.join(self.dir, "out"))
+        self.assertTrue(os.path.isfile(os.path.join(root, "setup.sh")),
+                        "the pack root is the directory, not what sits beside it")
+
+    def test_two_real_directories_are_left_alone(self):
+        # Only macOS metadata is ignored; a genuinely multi-rooted archive still
+        # unpacks to the destination itself.
+        path = os.path.join(self.dir, "two.tar.gz")
+        stage = self._stage()
+        with tarfile.open(path, "w:gz") as tf:
+            tf.add(stage, arcname="one")
+            tf.add(stage, arcname="two")
+        dest = os.path.join(self.dir, "out2")
+        self.assertEqual(satoru.unpack(path, dest), dest)
 
     def test_unpacking_twice_replaces_rather_than_merges(self):
         dest = os.path.join(self.dir, "out")
