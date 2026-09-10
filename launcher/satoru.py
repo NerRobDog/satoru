@@ -994,6 +994,27 @@ def _recorder(sink, on_output, keep=40):
     return watcher
 
 
+def _clean_up_after(paths, name):
+    """Remove the empty shell of a failed install; return what was left behind.
+
+    An install that got nowhere leaves directories we made and the pack did not
+    fill: Finder renders a .app with nothing in it as broken, and nothing records
+    it, so nobody would ever find it again. What the pack did write is a different
+    matter - that is its work, not ours to delete - so it stays, and its path is
+    returned to be named.
+    """
+    home, bundle = paths.home(name), paths.bundle(name)
+    if os.path.isdir(home) and os.listdir(home):
+        return home
+    for directory in (home, os.path.join(bundle, "Contents", "Resources"),
+                      os.path.join(bundle, "Contents"), bundle):
+        try:
+            os.rmdir(directory)
+        except OSError:
+            break
+    return ""
+
+
 def install_game(manifest, paths, probe=None, runner=None, fetch=None, unpack=None,
                  unquarantine=None, on_output=None):
     """Install a game, in the one order that makes each failure cheap.
@@ -1041,13 +1062,21 @@ def install_game(manifest, paths, probe=None, runner=None, fetch=None, unpack=No
 
     unquarantine(unpacked)
 
+    # The contract names these in the command environment, so they have to be
+    # there. A pack that believes the contract and writes "$SATORU_LOGS/install.log"
+    # would otherwise be the one to discover the promise was empty.
+    logs = paths.game_logs(game_id)
+    for d in (cache, logs):
+        if not os.path.isdir(d):
+            os.makedirs(d)
+
     env = dict(os.environ)
     env.update({
         "SATORU_GAME_HOME": paths.home(name),
         "SATORU_GAME_ID": game_id,
         "SATORU_LIBRARY": paths.library,
         "SATORU_CACHE": cache,
-        "SATORU_LOGS": paths.game_logs(game_id),
+        "SATORU_LOGS": logs,
         "SATORU_CONTRACT": str(CONTRACT),
     })
 
@@ -1078,12 +1107,22 @@ def install_game(manifest, paths, probe=None, runner=None, fetch=None, unpack=No
                       on_output=_recorder(said, on_output))
     if code != 0:
         reason, message = explain_exit(code, install, said)
+        leftovers = _clean_up_after(paths, name)
+        if leftovers:
+            # Half an engine is not ours to throw away, and nothing records it -
+            # the install did not finish - so the message is the only place it
+            # can be named.
+            message += " (what it wrote is still in %s)" % leftovers
         return _install_result(False, "install", code=code, reason=reason,
                        requirements=requirements, message=message,
-                       output="\n".join(said))
+                       leftovers=leftovers, output="\n".join(said))
 
-    entry = record_install(paths, manifest, (source or {}).get("sha256"))
+    # The shim first: installed.toml is a claim, and the shim is what makes it
+    # true. Recorded first, a shim that fails to write - a full disk, a read-only
+    # volume - leaves the state file saying installed while the launcher looks for
+    # a launch script that is not there and says the opposite.
     write_shim(paths, manifest)
+    entry = record_install(paths, manifest, (source or {}).get("sha256"))
     return _install_result(True, "done", reason="done", requirements=requirements,
                    entry=entry)
 

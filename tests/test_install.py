@@ -91,8 +91,28 @@ class Harness(unittest.TestCase):
     def unquarantine(self, path):
         self.steps.append("unquarantine")
 
+    def _timed(self, inner):
+        """Put the pack's commands on the same timeline as the other steps.
+
+        Recording them in a second list is how an ordering test came to assert
+        something true by construction: it compared an index in one list against
+        the length of that same list. One timeline, one assertion.
+        """
+        timeline = self.steps
+
+        class Timed(object):
+            def run(self, command, cwd=None, env=None, on_output=None):
+                timeline.append("run " + command)
+                return inner.run(command, cwd=cwd, env=env, on_output=on_output)
+
+            def __getattr__(self, key):
+                return getattr(inner, key)
+
+        return Timed()
+
     def install(self, **kw):
         runner = kw.pop("runner", None) or FakeRunner()
+        runner = self._timed(runner)
         return satoru.install_game(
             self.manifest, self.paths,
             probe=kw.pop("probe", None) or FakeProbe(),
@@ -105,9 +125,10 @@ class Order(Harness):
     def test_the_steps_happen_in_the_order_the_design_requires(self):
         result, runner = self.install()
         self.assertTrue(result["ok"], result)
-        self.assertEqual(self.steps, ["fetch", "unpack", "unquarantine"])
-        ran = [c["command"] for c in runner.calls]
-        self.assertEqual(ran, ["bash setup.sh --preflight", "bash setup.sh"])
+        self.assertEqual(self.steps, [
+            "fetch", "unpack", "unquarantine",
+            "run bash setup.sh --preflight", "run bash setup.sh",
+        ])
 
     def test_the_pack_is_told_where_to_install_itself(self):
         _, runner = self.install()
@@ -129,6 +150,80 @@ class Order(Harness):
         self.assertEqual(entry["version"], "v0.1")
         self.assertTrue(os.path.isfile(
             os.path.join(self.paths.home("Age of Empires IV"), "launch")))
+
+
+class WhatThePackIsGiven(Harness):
+    def test_the_directories_the_contract_promises_exist_when_the_pack_runs(self):
+        """A pack that follows the contract writes to "$SATORU_LOGS/install.log".
+
+        Naming a directory in the environment and not creating it makes the
+        contract a promise the first pack to believe it discovers is false.
+        """
+        looked = []
+
+        class Checking(FakeRunner):
+            def run(self, command, cwd=None, env=None, on_output=None):
+                looked.append((command, dict(
+                    (k, os.path.isdir(env[k])) for k in ("SATORU_LOGS", "SATORU_CACHE"))))
+                return FakeRunner.run(self, command, cwd=cwd, env=env, on_output=on_output)
+
+        self.install(runner=Checking())
+        self.assertTrue(looked, "no pack command ran at all")
+        for command, dirs in looked:
+            self.assertTrue(all(dirs.values()), "%s ran with %r" % (command, dirs))
+
+
+class TheLastTwoSteps(Harness):
+    def test_the_shim_exists_before_anything_claims_the_game_is_installed(self):
+        """installed.toml is a claim; the shim is what makes it true.
+
+        Recorded first and then a shim that fails to write - a full disk, a
+        read-only volume - leaves state saying installed while the launcher looks
+        for a launch script that is not there and reports not installed yet.
+        """
+        seen = {}
+        real = satoru.write_shim
+
+        def spy(paths, manifest):
+            seen["recorded"] = satoru.installed_entry(paths, "aoe4") is not None
+            return real(paths, manifest)
+
+        satoru.write_shim = spy
+        try:
+            self.install()
+        finally:
+            satoru.write_shim = real
+        self.assertIn("recorded", seen, "write_shim was never called")
+        self.assertFalse(seen["recorded"],
+                         "state was recorded before the shim it describes existed")
+
+    def test_a_failed_install_that_wrote_nothing_leaves_no_broken_app(self):
+        runner = FakeRunner({"bash setup.sh --preflight": 0, "bash setup.sh": 1})
+        result, _ = self.install(runner=runner)
+        self.assertFalse(result["ok"])
+        self.assertFalse(os.path.exists(self.paths.bundle("Age of Empires IV")),
+                         "Finder shows an .app with nothing in it as broken")
+
+    def test_a_failed_install_that_wrote_something_keeps_it_and_says_where(self):
+        """Half an engine is not ours to throw away, but it must be findable.
+
+        Nothing records it - the install did not finish - so the only place it can
+        be named is the message the person is about to read.
+        """
+        class Messy(FakeRunner):
+            def run(self, command, cwd=None, env=None, on_output=None):
+                if command.endswith("--preflight"):
+                    return 0
+                with open(os.path.join(env["SATORU_GAME_HOME"], "half.txt"), "w") as fh:
+                    fh.write("part of an engine")
+                return 1
+
+        result, _ = self.install(runner=Messy())
+        home = self.paths.home("Age of Empires IV")
+        self.assertFalse(result["ok"])
+        self.assertTrue(os.path.isfile(os.path.join(home, "half.txt")),
+                        "what the pack wrote is not ours to delete")
+        self.assertIn(home, result["message"])
 
 
 class WhichVolumeIsMeasured(Harness):
@@ -177,8 +272,8 @@ class Refusals(Harness):
         # The pack's preflight probes an ad-hoc-signed binary; a browser-downloaded
         # archive would have it SIGKILLed by Gatekeeper.
         self.install()
-        self.assertIn("unquarantine", self.steps)
-        self.assertLess(self.steps.index("unquarantine"), len(self.steps))
+        self.assertLess(self.steps.index("unquarantine"),
+                        self.steps.index("run bash setup.sh --preflight"))
 
     def test_a_failed_install_is_not_recorded_as_installed(self):
         # preflight says yes, the install itself falls over
