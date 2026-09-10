@@ -487,24 +487,26 @@ def command_target(cmd):
 class Paths(object):
     """The layout, in one place, so that no other code has to guess.
 
-    Bodies live where Steam and CrossOver keep theirs; logs where Console.app
-    looks; caches where the system already knows they are disposable; bundles
-    where Spotlight indexes them without asking for admin rights.
+    An installed game is a bundle in ~/Applications with its home *inside* it
+    (ADR-0001), so that it is one object a person can move, back up and throw
+    away. What is not inside it is the game's own files: 2.4 GB of ours against
+    45 GB of theirs. Those live in a library, and the library is what `root`
+    moves — that frees 96% of the space without taking the icon out of Launchpad.
+
+    Logs go where Console.app looks for them; the download cache goes where the
+    system already knows it is disposable. Neither follows `root`.
     """
 
     def __init__(self, home=None, root=None):
-        self.home = home or os.path.expanduser("~")
-        lib = os.path.join(self.home, "Library")
+        self.home_dir = home or os.path.expanduser("~")
+        lib = os.path.join(self.home_dir, "Library")
         self.support = os.path.join(lib, "Application Support", "satoru")
         self.caches = os.path.join(lib, "Caches", "satoru")
         self.logs = os.path.join(lib, "Logs", "satoru")
-        self.applications = os.path.join(self.home, "Applications", "satoru")
+        self.applications = os.path.join(self.home_dir, "Applications", "satoru")
         self.config_file = os.path.join(self.support, "config.toml")
         self.installed_file = os.path.join(self.support, "installed.toml")
-        # `root` moves the gigabytes and nothing else: whoever moves them is
-        # moving them to another disk, and a log Console.app cannot find is
-        # not a log.
-        self.root = expand(root) if root else self.support
+        self.library = expand(root) if root else os.path.join(self.support, "library")
 
     @staticmethod
     def _checked(game_id):
@@ -515,17 +517,28 @@ class Paths(object):
                 % (game_id,))
         return game_id
 
-    def game_home(self, game_id):
-        return os.path.join(self.root, self._checked(game_id))
+    def bundle(self, name):
+        return os.path.join(self.applications, _bundle_filename(name))
+
+    def home(self, name):
+        """The game's home, inside its own bundle. Passed to the pack as
+        SATORU_GAME_HOME; everything the pack installs goes here and nowhere else."""
+        return os.path.join(self.bundle(name), "Contents", "Resources", "home")
+
+    def shader_cache(self, name):
+        """Inside the home, so that the system cannot reclaim it.
+
+        Warmed pipelines are the difference between a first match and a stutter
+        festival - 434 MB of them for Overwatch - and until now they sat in the
+        user cache directory, which macOS may purge whenever it likes.
+        """
+        return os.path.join(self.home(name), "shader-cache")
 
     def game_cache(self, game_id):
         return os.path.join(self.caches, self._checked(game_id))
 
     def game_logs(self, game_id):
         return os.path.join(self.logs, self._checked(game_id))
-
-    def bundle(self, name):
-        return os.path.join(self.applications, _bundle_filename(name))
 
 
 def _bundle_filename(name):

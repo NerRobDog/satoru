@@ -1,68 +1,83 @@
 """Where things go.
 
-The rule the whole layout serves: nothing lands in the root of a home directory.
-Steam and CrossOver both keep their bodies in ~/Library/Application Support, and
-so does this. Logs go where Console.app looks for them, caches go where the
-system already knows they are disposable.
+Two rules the layout serves. Nothing lands in the root of a home directory:
+Steam and CrossOver both keep their bodies under ~/Library, and so does this.
+And the game's home lives *inside* its bundle (ADR-0001), so that an installed
+game is one object a person can move, back up and throw away.
 
-`root` in config.toml moves the game bodies (they are the gigabytes, and the
-people who move them are moving them to an external disk). It deliberately does
-not move logs or caches: a log Console.app cannot find is not a log.
+What does not live inside the bundle is the game's own files: 2.4 GB of ours
+against 45 GB of theirs. Those sit in a library, and the library is what `root`
+moves — moving it frees 96% of the space without taking the icon out of
+Launchpad.
 """
 import os
 import unittest
 
 from support import satoru
 
+HOME = "/Users/tester"
+APPS = HOME + "/Applications/satoru"
+SUPPORT = HOME + "/Library/Application Support/satoru"
+
 
 class Defaults(unittest.TestCase):
     def setUp(self):
-        self.p = satoru.Paths(home="/Users/tester")
+        self.p = satoru.Paths(home=HOME)
 
-    def test_body_goes_where_steam_and_crossover_put_theirs(self):
-        self.assertEqual(
-            self.p.game_home("aoe4"),
-            "/Users/tester/Library/Application Support/satoru/aoe4")
+    def test_bundle_is_findable_by_spotlight(self):
+        self.assertEqual(self.p.bundle("Age of Empires IV"),
+                         APPS + "/Age of Empires IV.app")
+
+    def test_the_home_lives_inside_the_bundle(self):
+        self.assertEqual(self.p.home("Age of Empires IV"),
+                         APPS + "/Age of Empires IV.app/Contents/Resources/home")
+
+    def test_shader_cache_lives_in_the_home_where_nothing_purges_it(self):
+        self.assertEqual(self.p.shader_cache("Age of Empires IV"),
+                         self.p.home("Age of Empires IV") + "/shader-cache")
+
+    def test_library_is_outside_the_bundle(self):
+        self.assertEqual(self.p.library, SUPPORT + "/library")
+        self.assertNotIn(".app", self.p.library)
 
     def test_logs_go_where_console_app_looks(self):
-        self.assertEqual(self.p.game_logs("aoe4"),
-                         "/Users/tester/Library/Logs/satoru/aoe4")
+        self.assertEqual(self.p.game_logs("aoe4"), HOME + "/Library/Logs/satoru/aoe4")
 
-    def test_caches_are_declared_disposable(self):
-        self.assertEqual(self.p.game_cache("aoe4"),
-                         "/Users/tester/Library/Caches/satoru/aoe4")
+    def test_download_cache_is_declared_disposable(self):
+        self.assertEqual(self.p.game_cache("aoe4"), HOME + "/Library/Caches/satoru/aoe4")
 
-    def test_bundles_are_findable_by_spotlight(self):
-        self.assertEqual(self.p.bundle("Age of Empires IV"),
-                         "/Users/tester/Applications/satoru/Age of Empires IV.app")
-
-    def test_state_lives_with_the_bodies(self):
-        self.assertEqual(self.p.installed_file,
-                         "/Users/tester/Library/Application Support/satoru/installed.toml")
+    def test_state_lives_with_the_umbrella(self):
+        self.assertEqual(self.p.installed_file, SUPPORT + "/installed.toml")
 
     def test_nothing_lands_in_the_home_root(self):
-        for path in (self.p.game_home("aoe4"), self.p.game_logs("aoe4"),
-                     self.p.game_cache("aoe4"), self.p.bundle("X"),
-                     self.p.installed_file):
-            rest = path[len("/Users/tester/"):]
+        for path in (self.p.home("X"), self.p.library, self.p.game_logs("aoe4"),
+                     self.p.game_cache("aoe4"), self.p.bundle("X"), self.p.installed_file):
+            rest = path[len(HOME + "/"):]
             self.assertIn("/", rest, "%s sits directly in the home directory" % path)
 
 
-class RootOverride(unittest.TestCase):
-    def test_moves_the_bodies(self):
-        p = satoru.Paths(home="/Users/tester", root="/Volumes/Games/satoru")
-        self.assertEqual(p.game_home("aoe4"), "/Volumes/Games/satoru/aoe4")
+class RootMovesTheGigabytes(unittest.TestCase):
+    """`root` moves the library. It does not move the bundle, the logs or the cache."""
 
-    def test_leaves_logs_and_caches_alone(self):
-        p = satoru.Paths(home="/Users/tester", root="/Volumes/Games/satoru")
-        self.assertTrue(p.game_logs("aoe4").startswith("/Users/tester/Library/Logs"))
-        self.assertTrue(p.game_cache("aoe4").startswith("/Users/tester/Library/Caches"))
+    def setUp(self):
+        self.p = satoru.Paths(home=HOME, root="/Volumes/Games8TB/satoru/library")
+
+    def test_library_follows_root(self):
+        self.assertEqual(self.p.library, "/Volumes/Games8TB/satoru/library")
+
+    def test_the_bundle_stays_in_applications(self):
+        self.assertTrue(self.p.bundle("X").startswith(APPS),
+                        "moving the library must not take the icon out of Launchpad")
+
+    def test_logs_and_cache_stay_put(self):
+        self.assertTrue(self.p.game_logs("aoe4").startswith(HOME + "/Library/Logs"))
+        self.assertTrue(self.p.game_cache("aoe4").startswith(HOME + "/Library/Caches"))
 
     def test_tilde_and_vars_are_expanded(self):
         os.environ["SATORU_TEST_DISK"] = "/Volumes/Ext"
         try:
-            p = satoru.Paths(home="/Users/tester", root="$SATORU_TEST_DISK/games")
-            self.assertEqual(p.game_home("x"), "/Volumes/Ext/games/x")
+            p = satoru.Paths(home=HOME, root="$SATORU_TEST_DISK/lib")
+            self.assertEqual(p.library, "/Volumes/Ext/lib")
         finally:
             del os.environ["SATORU_TEST_DISK"]
 
@@ -70,17 +85,22 @@ class RootOverride(unittest.TestCase):
 class Hostile(unittest.TestCase):
     """An id comes out of a manifest, and a manifest comes off the internet."""
 
+    def setUp(self):
+        self.p = satoru.Paths(home=HOME)
+
     def test_traversal_is_refused(self):
-        p = satoru.Paths(home="/Users/tester")
         for bad in ("..", "../etc", "a/b", "", "/abs"):
             with self.subTest(bad=bad):
-                self.assertRaises(ValueError, p.game_home, bad)
+                self.assertRaises(ValueError, self.p.game_logs, bad)
+                self.assertRaises(ValueError, self.p.game_cache, bad)
 
     def test_bundle_name_cannot_carry_a_separator(self):
-        p = satoru.Paths(home="/Users/tester")
-        # ":" is a path separator to the classic Mac APIs and shows up as "/" in Finder
-        self.assertEqual(p.bundle("Half/Life: Alyx"),
-                         "/Users/tester/Applications/satoru/Half-Life- Alyx.app")
+        # ":" is a path separator to the classic Mac APIs and Finder renders it as "/"
+        self.assertEqual(self.p.bundle("Half/Life: Alyx"),
+                         APPS + "/Half-Life- Alyx.app")
+
+    def test_a_hostile_name_cannot_escape_the_bundle_either(self):
+        self.assertTrue(self.p.home("../../etc").startswith(APPS))
 
 
 class Config(unittest.TestCase):
@@ -89,7 +109,7 @@ class Config(unittest.TestCase):
         self.assertIsNone(cfg["root"])
         self.assertTrue(cfg["check_updates"])
 
-    def test_reads_root_and_switch(self, ):
+    def test_reads_root_and_switch(self):
         import tempfile
         with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
             fh.write('root = "/Volumes/Games"\ncheck_updates = false\n')
