@@ -11,12 +11,16 @@ do nothing; actions whose script is not on disk say "missing".
     python3 launcher/satoru.py --check    # validate every game.toml, exit 1 on error
     python3 launcher/satoru.py --version  # what this build is, and which packs it knows
 """
+import contextlib
 import datetime
+import hashlib
 import os
 import platform
 import re
 import shlex
 import shutil
+import tarfile
+import urllib.request
 import subprocess
 import sys
 
@@ -578,6 +582,134 @@ def installed_games(paths):
     entries = read_installed(paths.installed_file)
     return dict((gid, e) for gid, e in entries.items()
                 if e.get("home") and os.path.isdir(e["home"]))
+
+
+# ----------------------------------------------------------------------------
+# getting a pack onto the disk, and being sure it is the pack
+
+
+class PackError(Exception):
+    """The pack is not what it claims to be. Never a reason to keep going."""
+
+
+def verify_sha256(path, expected):
+    if not expected:
+        return False
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 16), b""):
+            digest.update(chunk)
+    return digest.hexdigest() == str(expected).strip().lower()
+
+
+def fetch_pack(source, cache_dir, reporter=None):
+    """Return a local path to the pack archive, downloading it if needed.
+
+    A file already in the cache is used only if it still matches the hash: 133 MB
+    is not a thing to fetch twice because the launcher restarted, and a truncated
+    one is not a thing to trust because it has the right name.
+    """
+    url = (source or {}).get("url")
+    want = (source or {}).get("sha256")
+    if not url or not want:
+        raise PackError("the manifest has no source url and sha256 to fetch")
+
+    if not os.path.isdir(cache_dir):
+        os.makedirs(cache_dir)
+    target = os.path.join(cache_dir, os.path.basename(url.split("?", 1)[0]) or "pack.tar.gz")
+
+    if os.path.isfile(target) and verify_sha256(target, want):
+        return target
+
+    part = target + ".part"
+    try:
+        with contextlib.closing(urllib.request.urlopen(url)) as response:
+            total = int(response.headers.get("Content-Length") or 0)
+            done = 0
+            with open(part, "wb") as fh:
+                while True:
+                    chunk = response.read(1 << 16)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    done += len(chunk)
+                    if reporter:
+                        reporter(done, total)
+    except PackError:
+        raise
+    except Exception as exc:
+        _remove(part)
+        raise PackError("could not download %s: %s" % (url, exc))
+
+    if not verify_sha256(part, want):
+        # Leave nothing a later run could mistake for a good file.
+        _remove(part)
+        _remove(target)
+        raise PackError(
+            "sha256 of the downloaded archive does not match the manifest - "
+            "the download was corrupted, or the release was replaced")
+    os.replace(part, target)
+    return target
+
+
+def _remove(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _member_stays_inside(member, dest):
+    """Every path an archive gives us is data from the internet.
+
+    A member called ../../etc/passwd, an absolute name, or a symlink pointing out
+    of the tree are all attacks rather than files, and tarfile will happily follow
+    them if nobody checks.
+    """
+    root = os.path.realpath(dest)
+    for name in (member.name, member.linkname or ""):
+        if not name:
+            continue
+        if os.path.isabs(name):
+            return False
+        full = os.path.realpath(os.path.join(root, name))
+        if full != root and not full.startswith(root + os.sep):
+            return False
+    return True
+
+
+def unpack(archive, dest):
+    """Replace `dest` with the archive's contents, and return its root directory.
+
+    Replace rather than merge: an older pack's leftovers inside a new one is a
+    debugging session nobody should have to have.
+    """
+    if os.path.exists(dest):
+        shutil.rmtree(dest)
+    os.makedirs(dest)
+    try:
+        with contextlib.closing(tarfile.open(archive, "r:*")) as tf:
+            members = tf.getmembers()
+            for member in members:
+                if not _member_stays_inside(member, dest):
+                    raise PackError(
+                        "the archive contains %r, which points outside the "
+                        "directory it is being unpacked into" % (member.name,))
+            if sys.version_info >= (3, 12):
+                tf.extractall(dest, filter="tar")
+            else:
+                tf.extractall(dest)
+    except PackError:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
+    except tarfile.TarError as exc:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise PackError("could not unpack %s: %s" % (archive, exc))
+
+    entries = os.listdir(dest)
+    if len(entries) == 1 and os.path.isdir(os.path.join(dest, entries[0])):
+        return os.path.join(dest, entries[0])
+    return dest
 
 
 # ----------------------------------------------------------------------------
