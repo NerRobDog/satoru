@@ -1341,7 +1341,11 @@ def _install_via_umbrella(game, paths):
 
     result = install_game(game.manifest, paths, on_output=echo)
     if result["ok"]:
-        return 0, "%s installed. It is in Spotlight now." % game.name
+        # Not "it is in Spotlight now": nothing here writes Info.plist yet, so
+        # what is on disk is a directory named .app that Finder shows as broken.
+        # Say where it went and offer the action that does work.
+        return 0, "%s installed into %s. Launch it from here; the Finder icon " \
+                  "comes with the bundle work." % (game.name, paths.bundle(game.name))
     if result["step"] == "requirements":
         unmet = [r for r in result["requirements"] if not r["ok"]]
         lines = []
