@@ -835,6 +835,119 @@ def write_shim(paths, manifest, write=True):
 
 
 # ----------------------------------------------------------------------------
+# the install pipeline
+
+
+class SubprocessRunner(object):
+    """Runs a pack's command and streams its output, line by line, to a callback."""
+
+    def run(self, command, cwd=None, env=None, on_output=None):
+        proc = subprocess.Popen(
+            ["bash", "-c", command], cwd=cwd, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        try:
+            for raw in iter(proc.stdout.readline, b""):
+                line = raw.decode("utf-8", "replace").rstrip("\n")
+                if on_output:
+                    on_output(line)
+        finally:
+            proc.stdout.close()
+        return proc.wait()
+
+
+def strip_quarantine(path):
+    """A browser-downloaded archive carries com.apple.quarantine, and the pack's
+    own preflight runs an ad-hoc-signed binary that Gatekeeper would then kill.
+    We downloaded it, so removing the flag is ours to do."""
+    with open(os.devnull, "wb") as null:
+        subprocess.call(["xattr", "-dr", "com.apple.quarantine", path],
+                        stdout=null, stderr=null)
+
+
+def _install_result(ok, step, message="", code=0, **extra):
+    out = {"ok": ok, "step": step, "message": message, "code": code}
+    out.update(extra)
+    return out
+
+
+def install_game(manifest, paths, probe=None, runner=None, fetch=None, unpack=None,
+                 unquarantine=None, on_output=None):
+    """Install a game, in the one order that makes each failure cheap.
+
+    Requirements first, so a machine that cannot run the game never spends
+    133 MB finding out. Unquarantine before preflight, or the pack's own probe
+    is SIGKILLed. Preflight before the first write, so a refusal leaves nothing
+    half-built behind.
+    """
+    fetch = fetch or fetch_pack
+    unpack = unpack or globals()["unpack"]
+    unquarantine = unquarantine or strip_quarantine
+    runner = runner or SubprocessRunner()
+
+    game = manifest["game"]
+    name, game_id = game["name"], game["id"]
+    commands = manifest["commands"] or {}
+
+    requirements = check_requirements(manifest["requires"], probe=probe,
+                                      root=paths.library)
+    if not all_met(requirements):
+        unmet = [r for r in requirements if not r["ok"]]
+        return _install_result(False, "requirements", requirements=requirements,
+                       message="; ".join(r["label"] + ": " + r["detail"] for r in unmet))
+
+    source = manifest.get("source")
+    if not source or not source.get("url"):
+        return _install_result(False, "source", requirements=requirements,
+                       message="this pack declares no release to download - "
+                               "see its own instructions for installing it by hand")
+
+    cache = paths.game_cache(game_id)
+    try:
+        archive = fetch(source, cache, None)
+        unpacked = unpack(archive, os.path.join(cache, "unpacked"))
+    except PackError as exc:
+        return _install_result(False, "fetch", code=12, requirements=requirements, message=str(exc))
+
+    unquarantine(unpacked)
+
+    env = dict(os.environ)
+    env.update({
+        "SATORU_GAME_HOME": paths.home(name),
+        "SATORU_GAME_ID": game_id,
+        "SATORU_LIBRARY": paths.library,
+        "SATORU_CACHE": cache,
+        "SATORU_LOGS": paths.game_logs(game_id),
+        "SATORU_CONTRACT": str(CONTRACT),
+    })
+
+    preflight = commands.get("preflight")
+    if preflight:
+        code = runner.run(preflight, cwd=unpacked, env=env, on_output=on_output)
+        if code != 0:
+            # Nothing has been written yet, and nothing should be: leaving a
+            # half-built home is what this whole ordering exists to prevent.
+            return _install_result(False, "preflight", code=code, requirements=requirements,
+                           message="the pack refused to install here")
+
+    install = commands.get("install")
+    if not install:
+        return _install_result(False, "install", requirements=requirements,
+                       message="this pack declares no install command")
+
+    home = paths.home(name)
+    if not os.path.isdir(home):
+        os.makedirs(home)
+    code = runner.run(install, cwd=unpacked, env=env, on_output=on_output)
+    if code != 0:
+        return _install_result(False, "install", code=code, requirements=requirements,
+                       message="installation failed - see the log")
+
+    entry = record_install(paths, manifest, (source or {}).get("sha256"))
+    write_shim(paths, manifest)
+    return _install_result(True, "done", requirements=requirements, entry=entry)
+
+
+# ----------------------------------------------------------------------------
 # model
 
 
