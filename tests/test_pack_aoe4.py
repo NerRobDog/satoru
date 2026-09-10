@@ -86,6 +86,21 @@ class Preflight(unittest.TestCase):
 
     @unittest.skipIf(wineserver_running(),
                      "a wineserver is running, so preflight legitimately stops earlier")
+    def test_preflight_answers_wherever_it_appears_in_the_arguments(self):
+        """The flag loop accepted it anywhere; only $1 was ever looked at again.
+
+        `setup.sh --clone --preflight` therefore answered the question by doing
+        the whole thing: cloning a bottle, building a prefix, possibly fetching
+        Steam - when what was asked was whether it could.
+        """
+        rc, out, err = self.run_setup("--clone", "--preflight")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("satoru: mode=", out)
+        self.assertEqual(os.listdir(self.home), [],
+                         "--preflight built something because it was not first")
+
+    @unittest.skipIf(wineserver_running(),
+                     "a wineserver is running, so preflight legitimately stops earlier")
     def test_preflight_reports_the_facts_the_umbrella_shows(self):
         rc, out, err = self.run_setup("--preflight")
         self.assertEqual(rc, 0, err)
