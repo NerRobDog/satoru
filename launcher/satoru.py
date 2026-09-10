@@ -1086,35 +1086,60 @@ def load_config(path):
 
 
 class Game(object):
+    """One game as the launcher sees it, from either manifest shape.
+
+    A contract-1 manifest changes what Setup means. The pack stops naming a
+    script for the umbrella to shell out to and starts naming a release for it
+    to install, so the action is offered on the strength of [source] rather than
+    on a file existing at a path.
+    """
+
     def __init__(self, path, data):
-        g = data.get("game", {})
         self.path = path
         self.dir = os.path.dirname(path)
-        self.name = str(g.get("name", os.path.basename(self.dir)))
-        self.id = str(g.get("id", os.path.basename(self.dir)))
-        self.status = str(g.get("status", "wip"))
-        self.home = str(g.get("home", ""))
-        self.notes = str(g.get("notes", "")).strip()
-        self.cmds = {k: str(g.get(k, "")).strip() for k, _, _ in ACTIONS}
+        self.manifest, self.errors = parse_manifest(data)
+        game = self.manifest["game"]
+        self.contract = self.manifest["contract"]
+        self.name = game["name"] or os.path.basename(self.dir)
+        self.id = game["id"] or os.path.basename(self.dir)
+        self.status = game["status"]
+        self.summary = str(game["summary"]).strip()
+        self.notes = str(game["notes"]).strip()
+        self.source = self.manifest["source"]
+        install = self.manifest["install"]
+        self.home = install["home"]
+        self.manual_url = install["manual_url"]
+        self.foreign_note = install["foreign_note"]
+        commands, paths_ = self.manifest["commands"], self.manifest["paths"]
+        self.cmds = {
+            "setup": commands["install"],
+            "launch": commands["launch"],
+            "launch_plain": commands["launch_plain"],
+            "profile": paths_["profile"],
+            "logs": paths_["logs"],
+        }
 
     def validate(self):
-        errs = []
-        if "game" not in load_toml(self.path):
-            errs.append("no [game] table")
-        if self.status not in STATUSES:
-            errs.append("status %r not in %s" % (self.status, "/".join(STATUSES)))
-        if not self.name:
-            errs.append("empty name")
+        errs = list(self.errors)
         if self.id != os.path.basename(self.dir):
-            errs.append("id %r != directory %r" % (self.id, os.path.basename(self.dir)))
-        if self.status != "wip" and not self.cmds["launch"]:
+            errs.append("id %r does not match its directory %r"
+                        % (self.id, os.path.basename(self.dir)))
+        if self.contract == 0 and self.status != "wip" and not self.cmds["launch"]:
             errs.append("status %s but no launch command" % self.status)
         return errs
 
-    def action_state(self, key):
+    def installed_home(self, paths=None):
+        """Where this game would be, once installed. Only meaningful for v1."""
+        return (paths or Paths()).home(self.name)
+
+    def action_state(self, key, paths=None):
         """(state, detail): state is 'ok' | 'soon' | 'missing'."""
+        if self.status == "wip":
+            return "soon", ""
+        if self.contract >= 1:
+            return self._v1_action_state(key, paths)
         cmd = self.cmds.get(key, "")
-        if self.status == "wip" or not cmd:
+        if not cmd:
             return "soon", ""
         kind = dict((k, kind) for k, _, kind in ACTIONS)[key]
         if kind == "cmd":
@@ -1126,6 +1151,34 @@ class Game(object):
         if not os.path.exists(target):
             return "missing", target
         return "ok", target
+
+    def _v1_action_state(self, key, paths=None):
+        paths = paths or Paths()
+        home = paths.home(self.name)
+        if key == "setup":
+            if not self.source or not self.source.get("url"):
+                # An honest "there is no automatic install", not a broken manifest.
+                return "soon", ""
+            return "ok", "install %s (%s)" % (
+                self.name, self.source.get("version") or "latest")
+        if key in ("launch", "launch_plain"):
+            if not self.cmds.get(key):
+                return "soon", ""
+            shim = os.path.join(home, "launch")
+            if not os.path.isfile(shim):
+                # Nothing is missing: it has simply not been installed yet, and
+                # a path in the listing would read like something went wrong.
+                return "missing", "not installed yet"
+            return "ok", shim + (" --plain" if key == "launch_plain" else "")
+        target = self.cmds.get(key) or ""
+        if not target:
+            return "soon", ""
+        full = target if os.path.isabs(target) else os.path.join(home, target)
+        if not os.path.exists(full):
+            # Same reasoning as launch: before an install there is nothing to be
+            # missing, and a path here reads as a fault rather than a state.
+            return "missing", full if os.path.isdir(home) else "not installed yet"
+        return "ok", full
 
 
 def load_games(games_dir=GAMES_DIR):
@@ -1145,13 +1198,61 @@ def load_games(games_dir=GAMES_DIR):
 # ----------------------------------------------------------------------------
 # running things (outside curses)
 
+def current_paths():
+    """Paths as this machine's config says they are."""
+    base = Paths()
+    cfg = load_config(base.config_file)
+    return Paths(root=cfg["root"]) if cfg["root"] else base
+
+
+def _install_via_umbrella(game, paths):
+    """Contract v1: the umbrella installs the pack rather than shelling out to it."""
+    sys.stdout.write("Installing %s ...\n" % game.name)
+    sys.stdout.flush()
+
+    def echo(line):
+        sys.stdout.write("  " + line + "\n")
+        sys.stdout.flush()
+
+    result = install_game(game.manifest, paths, on_output=echo)
+    if result["ok"]:
+        return 0, "%s installed. It is in Spotlight now." % game.name
+    if result["step"] == "requirements":
+        unmet = [r for r in result["requirements"] if not r["ok"]]
+        lines = []
+        for req in unmet:
+            fix = req["fix"]
+            if fix and fix["kind"] == "command":
+                lines.append("%s: %s - run: %s" % (req["label"], req["detail"], fix["run"]))
+            elif fix:
+                lines.append("%s: %s - %s" % (req["label"], req["detail"], fix["hint"]))
+            else:
+                lines.append("%s: %s (nothing can change this)" % (req["label"], req["detail"]))
+        return 1, "cannot install here. " + "; ".join(lines)
+    return 1, "%s failed at %s: %s" % (game.name, result["step"], result["message"])
+
+
 def run_action(game, key):
     """Returns (returncode, message). Called with the terminal in normal mode."""
-    state, detail = game.action_state(key)
+    paths = current_paths()
+    state, detail = game.action_state(key, paths)
     if state == "soon":
+        if key == "setup" and game.manual_url:
+            # Not a dead button: there is a way to install this, it is just not ours.
+            return 0, "%s has no automatic install yet. Instructions: %s" % (
+                game.name, game.manual_url)
         return 0, "%s: SOON — not available for %s yet." % (key, game.name)
     if state == "missing":
+        if game.contract >= 1 and key in ("launch", "launch_plain"):
+            return 1, "%s is not installed yet - run Setup first." % game.name
         return 1, "%s: missing %s (submodule not checked out?)" % (key, detail)
+    if game.contract >= 1 and key == "setup":
+        return _install_via_umbrella(game, paths)
+    if game.contract >= 1 and key in ("launch", "launch_plain"):
+        args = ["--plain"] if key == "launch_plain" else []
+        shim = os.path.join(paths.home(game.name), "launch")
+        rc = subprocess.call([shim] + args)
+        return rc, "%s exited with %d." % (key, rc)
     kind = dict((k, kind) for k, _, kind in ACTIONS)[key]
     if kind == "file":
         pager = os.environ.get("PAGER", "less")
@@ -1203,6 +1304,10 @@ def describe(games, out=sys.stdout):
                 out.write("    %-32s · SOON\n" % label)
             else:
                 out.write("    %-32s · missing: %s\n" % (label, detail))
+        if g.manual_url:
+            out.write("    %-32s %s\n" % ("Instructions", g.manual_url))
+        if g.foreign_note:
+            out.write("    %-32s %s\n" % ("Note", g.foreign_note))
         if g.notes:
             for line in g.notes.splitlines():
                 out.write("      %s\n" % line)

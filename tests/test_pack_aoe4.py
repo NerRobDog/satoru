@@ -106,5 +106,75 @@ class Preflight(unittest.TestCase):
         self.assertIn("satoru: home=" + legacy, out.decode("utf-8", "replace"))
 
 
+@unittest.skipUnless(os.path.isfile(os.path.join(PACK_SRC, "uninstall.sh")),
+                     "needs the aoe4 submodule")
+class Uninstall(unittest.TestCase):
+    """Removing the pack must not remove the game.
+
+    The prefix reaches the user's Steam library through a symlink. Deleting a
+    symlink deletes the link; following it would delete 45 GB the pack never
+    owned. This builds exactly that shape and checks the target survives.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.home = os.path.join(self.dir, "home")
+        self.precious = os.path.join(self.dir, "steam-library")
+        os.makedirs(os.path.join(self.precious, "Age of Empires IV"))
+        with open(os.path.join(self.precious, "Age of Empires IV", "game.dat"), "w") as fh:
+            fh.write("45 GB, pretend")
+        steamapps = os.path.join(self.home, "prefix", "drive_c", "steamapps")
+        os.makedirs(steamapps)
+        os.symlink(self.precious, os.path.join(steamapps, "common"))
+        os.makedirs(os.path.join(self.home, "Engine"))
+        with open(os.path.join(self.home, "aoe4.conf"), "w") as fh:
+            fh.write("pace = 60\n")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def run_uninstall(self, *args):
+        env = dict(os.environ)
+        env["SATORU_GAME_HOME"] = self.home
+        proc = subprocess.Popen(
+            ["bash", os.path.join(PACK_SRC, "uninstall.sh")] + list(args),
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = proc.communicate(timeout=60)
+        return (proc.returncode, out.decode("utf-8", "replace"),
+                err.decode("utf-8", "replace"))
+
+    def test_dry_run_lists_sizes_and_removes_nothing(self):
+        rc, out, err = self.run_uninstall("--dry-run")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("aoe4.conf", out)
+        self.assertIn("(total)", out)
+        self.assertTrue(os.path.isdir(self.home), "--dry-run must not remove anything")
+
+    def test_dry_run_names_what_it_will_not_touch(self):
+        _, out, _ = self.run_uninstall("--dry-run")
+        self.assertIn(self.precious, out,
+                      "a linked library should be named as not-ours, not silently skipped")
+
+    def test_it_refuses_without_being_told_to(self):
+        rc, _, err = self.run_uninstall()
+        self.assertEqual(rc, 2)
+        self.assertIn("refusing", err)
+        self.assertTrue(os.path.isdir(self.home))
+
+    def test_removing_the_pack_leaves_the_game_alone(self):
+        rc, _, err = self.run_uninstall("--yes")
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(os.path.exists(self.home))
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.precious, "Age of Empires IV", "game.dat")),
+            "the user's Steam library was followed and deleted")
+
+    def test_nothing_to_remove_is_exit_11_not_a_failure(self):
+        shutil.rmtree(self.home)
+        rc, out, _ = self.run_uninstall("--yes")
+        self.assertEqual(rc, 11)
+        self.assertIn("nothing to remove", out)
+
+
 if __name__ == "__main__":
     unittest.main()
