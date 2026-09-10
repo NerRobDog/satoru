@@ -886,6 +886,51 @@ def _install_result(ok, step, message="", code=0, **extra):
     return out
 
 
+# Contract v1 gives these five codes a meaning of their own, and everything else
+# one meaning: whatever ran is not a contract-1 pack. The difference matters to
+# the reader - "this machine is missing something" sends them to fix it, while
+# "the pack cannot answer" sends them to update the pack - and it is the whole
+# reason the contract numbers its exits at all.
+CONTRACT_EXITS = {
+    10: "the pack says this machine is not ready for it",
+    11: "there is nothing here to do",
+    12: "the pack's own files are not the ones it expects - fetch it again",
+    20: "cancelled",
+    1: "the pack broke in a way it did not expect",
+}
+
+_EXIT_REASON = {10: "refused", 20: "refused", 11: "nothing-to-do",
+                12: "stale-files", 1: "failed"}
+
+
+def explain_exit(code, command, output=None):
+    """(reason, message) for the exit code a pack answered with.
+
+    The pack's own last words are appended where it has any: for code 10 the
+    contract says its message is shown as it wrote it, and for a pack that does
+    not speak the contract at all its complaint - `unknown flag --preflight` -
+    is the single most useful thing on the screen.
+    """
+    said = [line for line in (output or []) if line and line.strip()]
+    tail = said[-1].strip() if said else ""
+    if code in CONTRACT_EXITS:
+        message = CONTRACT_EXITS[code]
+        return _EXIT_REASON[code], (message + ": " + tail) if tail else message
+    message = ("this pack does not understand `%s` (exit %d) - it is probably "
+               "older than the manifest that points at it" % (command, code))
+    return "not-contract", (message + ": " + tail) if tail else message
+
+
+def _recorder(sink, on_output, keep=40):
+    """Feed the caller every line, and keep the tail for the failure message."""
+    def watcher(line):
+        sink.append(line)
+        del sink[:-keep]
+        if on_output:
+            on_output(line)
+    return watcher
+
+
 def install_game(manifest, paths, probe=None, runner=None, fetch=None, unpack=None,
                  unquarantine=None, on_output=None):
     """Install a game, in the one order that makes each failure cheap.
@@ -908,12 +953,14 @@ def install_game(manifest, paths, probe=None, runner=None, fetch=None, unpack=No
                                       root=paths.library)
     if not all_met(requirements):
         unmet = [r for r in requirements if not r["ok"]]
-        return _install_result(False, "requirements", requirements=requirements,
+        return _install_result(False, "requirements", reason="requirements",
+                       requirements=requirements,
                        message="; ".join(r["label"] + ": " + r["detail"] for r in unmet))
 
     source = manifest.get("source")
     if not source or not source.get("url"):
-        return _install_result(False, "source", requirements=requirements,
+        return _install_result(False, "source", reason="no-source",
+                       requirements=requirements,
                        message="this pack declares no release to download - "
                                "see its own instructions for installing it by hand")
 
@@ -922,7 +969,8 @@ def install_game(manifest, paths, probe=None, runner=None, fetch=None, unpack=No
         archive = fetch(source, cache, None)
         unpacked = unpack(archive, os.path.join(cache, "unpacked"))
     except PackError as exc:
-        return _install_result(False, "fetch", code=12, requirements=requirements, message=str(exc))
+        return _install_result(False, "fetch", code=12, reason="stale-files",
+                       requirements=requirements, message=str(exc))
 
     unquarantine(unpacked)
 
@@ -938,29 +986,39 @@ def install_game(manifest, paths, probe=None, runner=None, fetch=None, unpack=No
 
     preflight = commands.get("preflight")
     if preflight:
-        code = runner.run(preflight, cwd=unpacked, env=env, on_output=on_output)
+        said = []
+        code = runner.run(preflight, cwd=unpacked, env=env,
+                          on_output=_recorder(said, on_output))
         if code != 0:
             # Nothing has been written yet, and nothing should be: leaving a
             # half-built home is what this whole ordering exists to prevent.
-            return _install_result(False, "preflight", code=code, requirements=requirements,
-                           message="the pack refused to install here")
+            reason, message = explain_exit(code, preflight, said)
+            return _install_result(False, "preflight", code=code, reason=reason,
+                           requirements=requirements, message=message,
+                           output="\n".join(said))
 
     install = commands.get("install")
     if not install:
-        return _install_result(False, "install", requirements=requirements,
+        return _install_result(False, "install", reason="no-command",
+                       requirements=requirements,
                        message="this pack declares no install command")
 
     home = paths.home(name)
     if not os.path.isdir(home):
         os.makedirs(home)
-    code = runner.run(install, cwd=unpacked, env=env, on_output=on_output)
+    said = []
+    code = runner.run(install, cwd=unpacked, env=env,
+                      on_output=_recorder(said, on_output))
     if code != 0:
-        return _install_result(False, "install", code=code, requirements=requirements,
-                       message="installation failed - see the log")
+        reason, message = explain_exit(code, install, said)
+        return _install_result(False, "install", code=code, reason=reason,
+                       requirements=requirements, message=message,
+                       output="\n".join(said))
 
     entry = record_install(paths, manifest, (source or {}).get("sha256"))
     write_shim(paths, manifest)
-    return _install_result(True, "done", requirements=requirements, entry=entry)
+    return _install_result(True, "done", reason="done", requirements=requirements,
+                   entry=entry)
 
 
 # ----------------------------------------------------------------------------

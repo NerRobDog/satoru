@@ -174,5 +174,70 @@ class Refusals(Harness):
         self.assertEqual(result["step"], "source")
 
 
+class TalkingRunner(FakeRunner):
+    """A pack that says something before it exits, the way a real one does."""
+
+    def __init__(self, codes=None, says=None):
+        FakeRunner.__init__(self, codes)
+        self.says = says or []
+
+    def run(self, command, cwd=None, env=None, on_output=None):
+        for line in self.says:
+            if on_output:
+                on_output(line)
+        return FakeRunner.run(self, command, cwd=cwd, env=env, on_output=on_output)
+
+
+class WhatTheExitCodeMeans(Harness):
+    """Contract v1 gives five exit codes their own meaning, and everything else
+    one meaning: this pack is not speaking the contract.
+
+    Until now every non-zero code became the same sentence, which is how the real
+    v0.1 release — whose setup.sh predates --preflight and answers
+    `unknown flag --preflight` with exit 2 — was reported as a pack refusing the
+    machine, sending the reader to hunt for a fault that is not there.
+    """
+
+    def test_a_stated_refusal_is_told_apart_from_a_pack_that_cannot_answer(self):
+        refused, _ = self.install(runner=FakeRunner({"--preflight": 10}))
+        self.assertEqual(refused["reason"], "refused")
+        confused, _ = self.install(runner=FakeRunner({"--preflight": 2}))
+        self.assertEqual(confused["reason"], "not-contract")
+
+    def test_an_unknown_code_names_the_code_and_blames_the_version(self):
+        result, _ = self.install(runner=FakeRunner({"--preflight": 2}))
+        self.assertIn("2", result["message"])
+        self.assertIn("older", result["message"])
+        self.assertNotIn("refused to install here", result["message"])
+
+    def test_every_contract_code_gets_its_own_words(self):
+        said = {}
+        for code in (10, 11, 12, 20, 1):
+            result, _ = self.install(runner=FakeRunner({"--preflight": code}))
+            said[code] = result["message"]
+        self.assertEqual(len(set(said.values())), len(said), said)
+
+    def test_the_packs_own_words_are_what_the_reader_gets(self):
+        # The spec is explicit for code 10: the pack's own message is shown as is.
+        runner = TalkingRunner({"--preflight": 10},
+                               says=["checking CrossOver...",
+                                     "CrossOver 25.7 or newer is required"])
+        result, _ = self.install(runner=runner)
+        self.assertIn("CrossOver 25.7 or newer is required", result["message"])
+        self.assertIn("CrossOver 25.7 or newer is required", result["output"])
+
+    def test_an_install_that_cannot_answer_is_told_apart_too(self):
+        runner = FakeRunner({"bash setup.sh --preflight": 0, "bash setup.sh": 127})
+        result, _ = self.install(runner=runner)
+        self.assertEqual(result["step"], "install")
+        self.assertEqual(result["reason"], "not-contract")
+
+    def test_a_caller_watching_the_output_still_sees_every_line(self):
+        seen = []
+        runner = TalkingRunner({"--preflight": 10}, says=["one", "two"])
+        self.install(runner=runner, on_output=seen.append)
+        self.assertEqual(seen, ["one", "two"])
+
+
 if __name__ == "__main__":
     unittest.main()
