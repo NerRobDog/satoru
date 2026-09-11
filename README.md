@@ -63,6 +63,11 @@ Status vocabulary (also used by `game.toml`): `rc` = release candidate, pack
 tested end-to-end on two machines; `playable` = we play it, install is still
 hand-driven; `wip` = not for users yet.
 
+Adding a game means writing a `game.toml` and four commands; satoru does the
+rest. [`docs/pack-contract.md`](docs/pack-contract.md) is what you write it
+against — the manifest, the environment your commands get, the exit codes, and
+what is not implemented yet.
+
 ## Layout
 
 ```

@@ -133,6 +133,29 @@ def _quoted(path):
     return shlex.quote(path)
 
 
+class PlainModeIsACommand(Harness):
+    """launch_plain names a command, and the contract says so.
+
+    It was read as a flag - any non-empty value meant "append --plain to launch"
+    - so a pack whose plain mode is a different script ran the wrong thing, with
+    the action offered and nothing warning anybody.
+    """
+
+    def test_a_plain_mode_that_is_a_different_command_is_the_one_that_runs(self):
+        data = satoru._parse_minimal_toml(
+            MANIFEST.replace('launch = "aoe4.sh"\n',
+                             'launch = "aoe4.sh"\nlaunch_plain = "safe-mode.sh"\n'))
+        manifest, errors = satoru.parse_manifest(data)
+        self.assertEqual(errors, [])
+        text = satoru.shim_text(self.paths, manifest)
+        self.assertIn("safe-mode.sh", text)
+
+    def test_the_ordinary_case_stays_one_line(self):
+        text = satoru.shim_text(self.paths, self.manifest)
+        self.assertNotIn("--plain", text,
+                         "a pack with no plain mode should get no branch for one")
+
+
 class TheUpdateSwitch(Harness):
     """A switch the user is told to flip has to change something."""
 
@@ -215,6 +238,59 @@ class WhatTheReaderSees(Harness):
 
     def test_the_warning_that_a_pack_touches_something_else_is_shown(self):
         self.assertIn("modifies your CrossOver bottle", self._described())
+
+
+class TheDocumentSomeoneElseReads(unittest.TestCase):
+    """The contract's own example has to be a manifest that works.
+
+    The audit's flattest finding: copying the example out of the document and
+    running satoru on the stock macOS interpreter failed before a single key was
+    looked at. A document you cannot copy from is not a contract.
+    """
+
+    def _example(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        path = os.path.join(here, "docs", "pack-contract.md")
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        blocks = []
+        inside = False
+        current = []
+        for line in text.splitlines():
+            if line.startswith("```toml"):
+                inside, current = True, []
+                continue
+            if inside and line.startswith("```"):
+                blocks.append("\n".join(current) + "\n")
+                inside = False
+                continue
+            if inside:
+                current.append(line)
+        self.assertTrue(blocks, "the contract has no example manifest in it")
+        return blocks[0]
+
+    def test_the_example_manifest_parses(self):
+        satoru._parse_minimal_toml(self._example())
+
+    def test_the_example_manifest_validates(self):
+        manifest, errors = satoru.parse_manifest(
+            satoru._parse_minimal_toml(self._example()))
+        self.assertEqual(errors, [])
+        self.assertEqual(manifest["contract"], satoru.CONTRACT)
+        self.assertEqual(manifest["game"]["id"], "aoe4")
+
+    def test_every_environment_variable_the_document_names_is_really_set(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "docs", "pack-contract.md"),
+                  encoding="utf-8") as fh:
+            text = fh.read()
+        import re
+        named = set(re.findall(r"\bSATORU_[A-Z_]+\b", text))
+        with open(os.path.join(here, "launcher", "satoru.py"),
+                  encoding="utf-8") as fh:
+            source = fh.read()
+        for var in sorted(named):
+            self.assertIn(var, source, "%s is documented and never set" % var)
 
 
 if __name__ == "__main__":

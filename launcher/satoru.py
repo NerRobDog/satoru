@@ -1144,6 +1144,16 @@ def shim_text(paths, manifest, check_updates=True):
         add("fi")
         add("")
     add('cd "$HERE" || exit 1')
+    plain = (manifest["commands"] or {}).get("launch_plain") or ""
+    if plain and plain.split() != (launch + " --plain").split():
+        # launch_plain names a command. Treating it as a flag - any value meaning
+        # "run launch with --plain" - silently ran the wrong thing for a pack
+        # whose plain mode is a different script.
+        add('if [ "${1:-}" = "--plain" ]; then')
+        add("  shift")
+        add("  exec sh -c %s satoru-launch \"$@\""
+            % shlex.quote(_launch_command_in_home(plain) + ' "$@"'))
+        add("fi")
     add("exec sh -c %s satoru-launch \"$@\"" % shlex.quote(_launch_command_in_home(launch) + ' "$@"'))
     add("")
     return "\n".join(out)
