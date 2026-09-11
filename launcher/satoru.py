@@ -78,155 +78,386 @@ ACTIONS = (
 
 
 # ----------------------------------------------------------------------------
-# TOML: tomllib on 3.11+, otherwise a minimal reader for the game.toml subset
-# ([section], key = "string" | 123 | true | false | """multi-line""", # comments)
+# The manifest language.
+#
+# One reader, on every interpreter, on purpose. tomllib arrived in 3.11 and the
+# Python that ships with macOS is 3.9, so choosing a reader per interpreter meant
+# a manifest could mean one thing to the person who wrote it and another to the
+# person who runs it - an accent spelled é in a path, an escape inside a
+# multi-line note - with nothing raised on either side. An audit found 58 such
+# differences. Reading the same way everywhere closes that class by construction;
+# tomllib stays, as the oracle the tests check this reader against.
+#
+# Supported, and this list is the whole of it: [section] headers one level deep;
+# bare keys of letters, digits, underscore and dash; basic strings with the
+# v1.0.0 escapes; multi-line basic strings with escapes and line continuation;
+# literal strings, single- and multi-line; true and false; decimal integers with
+# optional underscores; arrays of one of those types, over as many lines as you
+# like; # comments.
+#
+# Refused by name: floats, dates and times, non-decimal integers, inline tables,
+# dotted or quoted keys, arrays of tables, nested arrays, arrays of mixed types.
+# These are legal TOML and a subset that guessed at them would be a trap; a
+# subset that says "not supported here" is a contract.
 
-def _unescape(text):
-    """TOML basic-string escapes, in one pass.
+_BARE_KEY = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+_HEX = frozenset("0123456789abcdefABCDEF")
+_ESCAPES = {'"': '"', "\\": "\\", "b": "\b", "f": "\f", "n": "\n", "r": "\r",
+            "t": "\t"}
 
-    A chain of .replace() calls cannot do this: unescaping \\" before \\\\ turns
-    a literal backslash-then-quote into a quote, and doing it the other way
-    round breaks the quote. One left-to-right pass is the only correct order.
+
+class _Toml(object):
+    """A cursor over the whole document.
+
+    Line by line is what the previous reader did, and it is why a value could
+    not span lines, why a comment after a closing delimiter swallowed the rest
+    of the file, and why junk after a value went unnoticed. A cursor makes each
+    of those the same question: what comes next.
     """
-    out = []
-    i = 0
-    simple = {'"': '"', "\\": "\\", "n": "\n", "t": "\t", "r": "\r"}
-    while i < len(text):
-        ch = text[i]
-        if ch == "\\" and i + 1 < len(text):
-            nxt = text[i + 1]
-            out.append(simple.get(nxt, "\\" + nxt))
-            i += 2
-            continue
-        out.append(ch)
-        i += 1
-    return "".join(out)
 
+    def __init__(self, text):
+        if text.startswith("﻿"):
+            # A browser, a copy-paste or a Windows editor adds this. It is not
+            # part of the first key's name.
+            text = text[1:]
+        self.s = text.replace("\r\n", "\n")
+        self.i = 0
+        self.n = len(self.s)
 
-def _parse_scalar(val, lineno):
-    """A bare value: string, bool or integer. Everything else is an error, loudly."""
-    val = val.strip()
-    if val.startswith('"') and val.endswith('"') and len(val) >= 2:
-        return _unescape(val[1:-1])
-    val = val.split("#", 1)[0].strip()
-    if val == "true":
-        return True
-    if val == "false":
-        return False
-    try:
-        return int(val)
-    except ValueError:
-        raise ValueError("line %d: unsupported value %r" % (lineno, val))
+    # -- where we are ---------------------------------------------------------
 
+    def line(self):
+        return self.s.count("\n", 0, self.i) + 1
 
-def _parse_array(val, lineno):
-    """A single-line array: ["a", "b"]. Enough for [requires] tools, and no more.
+    def fail(self, message):
+        raise ValueError("line %d: %s" % (self.line(), message))
 
-    Scanning for the closing bracket has to ignore one inside a string, or a path
-    with a bracket in it would end the array early.
-    """
-    depth, end, in_str = 0, -1, False
-    for pos, ch in enumerate(val):
-        if ch == '"' and (pos == 0 or val[pos - 1] != "\\"):
-            in_str = not in_str
-        elif not in_str and ch == "[":
-            depth += 1
-        elif not in_str and ch == "]":
-            depth -= 1
-            if depth == 0:
-                end = pos
+    def fail_at(self, line, message):
+        """For a value that spans lines, the opening is the useful place to point."""
+        raise ValueError("line %d: %s" % (line, message))
+
+    def peek(self, ahead=0):
+        j = self.i + ahead
+        return self.s[j] if j < self.n else ""
+
+    def starts(self, text):
+        return self.s.startswith(text, self.i)
+
+    # -- whitespace -----------------------------------------------------------
+
+    def skip_inline(self):
+        while self.i < self.n and self.s[self.i] in " \t":
+            self.i += 1
+
+    def skip_comment(self):
+        if self.peek() == "#":
+            while self.i < self.n and self.s[self.i] != "\n":
+                self.i += 1
+
+    def skip_blanks(self):
+        """Between statements: spaces, comments and line endings."""
+        while self.i < self.n:
+            ch = self.s[self.i]
+            if ch in " \t\n":
+                self.i += 1
+            elif ch == "#":
+                self.skip_comment()
+            elif ch == "\r":
+                self.fail("a bare carriage return is not a line ending")
+            else:
+                return
+
+    def end_of_statement(self):
+        """A statement owns the rest of its line, and nothing else may be on it."""
+        self.skip_inline()
+        self.skip_comment()
+        if self.i >= self.n:
+            return
+        if self.s[self.i] == "\n":
+            self.i += 1
+            return
+        rest = self.s[self.i:].split("\n", 1)[0].strip()
+        self.fail("junk after the value: %r" % rest)
+
+    # -- the document ---------------------------------------------------------
+
+    def parse(self):
+        data = {}
+        table, table_name = data, None
+        seen = {None: set()}
+        while True:
+            self.skip_blanks()
+            if self.i >= self.n:
+                return data
+            if self.s[self.i] == "[":
+                table_name = self.table_header(data)
+                table = data[table_name]
+                seen[table_name] = set()
+                continue
+            key = self.bare_key()
+            self.skip_inline()
+            if self.peek() != "=":
+                self.fail("expected = after %r" % key)
+            self.i += 1
+            self.skip_inline()
+            value = self.value()
+            self.end_of_statement()
+            if key in seen[table_name]:
+                self.fail("%r is given twice" % key)
+            seen[table_name].add(key)
+            table[key] = value
+
+    def table_header(self, data):
+        line = self.line()
+        self.i += 1
+        if self.peek() == "[":
+            self.fail("an array of tables is not supported here")
+        self.skip_inline()
+        name = self.bare_key("table name")
+        self.skip_inline()
+        if self.peek() != "]":
+            self.fail_at(line, "expected ] to close [%s" % name)
+        self.i += 1
+        self.end_of_statement()
+        if name in data:
+            # Covers a repeated [section] and a bare key of the same name; TOML
+            # forbids declaring a table twice either way.
+            self.fail_at(line, "%r is declared twice" % name)
+        data[name] = {}
+        return name
+
+    def bare_key(self, what="key"):
+        if self.peek() in ('"', "'"):
+            self.fail("a quoted %s is not supported here" % what)
+        start = self.i
+        while self.i < self.n and self.s[self.i] in _BARE_KEY:
+            self.i += 1
+        if self.i == start:
+            self.fail("expected a %s" % what)
+        key = self.s[start:self.i]
+        if self.peek() == ".":
+            self.fail("a dotted %s is not supported here" % what)
+        return key
+
+    # -- values ---------------------------------------------------------------
+
+    def value(self):
+        ch = self.peek()
+        if ch == "" or ch == "\n":
+            self.fail("expected a value")
+        if self.starts('"""'):
+            return self.multiline_basic()
+        if ch == '"':
+            return self.basic_string()
+        if self.starts("'''"):
+            return self.multiline_literal()
+        if ch == "'":
+            return self.literal_string()
+        if ch == "[":
+            return self.array()
+        if ch == "{":
+            self.fail("an inline table is not supported here")
+        return self.atom()
+
+    def atom(self):
+        start = self.i
+        while self.i < self.n and self.s[self.i] not in " \t\n,]#":
+            self.i += 1
+        raw = self.s[start:self.i]
+        if not raw:
+            self.fail("expected a value")
+        if raw == "true":
+            return True
+        if raw == "false":
+            return False
+        return self.integer(raw)
+
+    def integer(self, raw):
+        body = raw[1:] if raw[:1] in "+-" else raw
+        low = body.lower()
+        if low[:2] in ("0x", "0o", "0b"):
+            self.fail("hexadecimal, octal and binary integers are not supported "
+                      "here; write it in decimal")
+        if "." in body or "e" in low or low in ("inf", "nan"):
+            self.fail("floats are not supported here")
+        if "-" in body[1:] or ":" in body:
+            self.fail("dates and times are not supported here")
+        if body.startswith("_") or body.endswith("_") or "__" in body:
+            self.fail("unsupported value %r" % raw)
+        digits = body.replace("_", "")
+        if not digits or not digits.isdigit() or not digits.isascii():
+            self.fail("unsupported value %r" % raw)
+        if len(digits) > 1 and digits[0] == "0":
+            self.fail("unsupported value %r: an integer may not have a leading zero"
+                      % raw)
+        return int(raw.replace("_", ""))
+
+    def forbid_control(self, ch, allow_newline=False):
+        o = ord(ch)
+        if ch == "\t" or (allow_newline and ch == "\n"):
+            return
+        if o < 0x20 or o == 0x7F:
+            self.fail("a control character (U+%04X) has to be escaped in a string"
+                      % o)
+
+    def escape(self, multiline):
+        ch = self.peek()
+        if ch == "":
+            self.fail("a string may not end in a lone backslash")
+        if ch in _ESCAPES:
+            self.i += 1
+            return _ESCAPES[ch]
+        if ch in ("u", "U"):
+            width = 4 if ch == "u" else 8
+            self.i += 1
+            digits = self.s[self.i:self.i + width]
+            if len(digits) != width or any(c not in _HEX for c in digits):
+                self.fail("\\%s needs %d hex digits" % (ch, width))
+            self.i += width
+            point = int(digits, 16)
+            if point > 0x10FFFF or 0xD800 <= point <= 0xDFFF:
+                self.fail("\\%s%s is not a character" % (ch, digits))
+            return chr(point)
+        if multiline:
+            # A backslash at the end of a line joins it to the next, swallowing
+            # the line ending and the indent that follows.
+            j = self.i
+            while j < self.n and self.s[j] in " \t":
+                j += 1
+            if j < self.n and self.s[j] == "\n":
+                j += 1
+                while j < self.n and self.s[j] in " \t\n":
+                    j += 1
+                self.i = j
+                return ""
+        self.fail("unknown escape \\%s" % ch)
+
+    def basic_string(self):
+        line = self.line()
+        self.i += 1
+        out = []
+        while True:
+            if self.i >= self.n or self.s[self.i] == "\n":
+                self.fail_at(line, "unterminated string")
+            ch = self.s[self.i]
+            if ch == '"':
+                self.i += 1
+                return "".join(out)
+            if ch == "\\":
+                self.i += 1
+                out.append(self.escape(False))
+                continue
+            self.forbid_control(ch)
+            out.append(ch)
+            self.i += 1
+
+    def multiline_basic(self):
+        line = self.line()
+        self.i += 3
+        if self.peek() == "\n":
+            # Exactly one, and only where it follows the opening delimiter.
+            self.i += 1
+        out = []
+        while True:
+            if self.i >= self.n:
+                self.fail_at(line, "unterminated multi-line string")
+            if self.starts('"""'):
+                self.i += 3
+                if self.peek() == '"':
+                    self.fail_at(line, "a multi-line string ending in a quote is "
+                                       "not supported here; escape it as \\\"")
+                return "".join(out)
+            ch = self.s[self.i]
+            if ch == "\\":
+                self.i += 1
+                out.append(self.escape(True))
+                continue
+            self.forbid_control(ch, allow_newline=True)
+            out.append(ch)
+            self.i += 1
+
+    def literal_string(self):
+        line = self.line()
+        self.i += 1
+        out = []
+        while True:
+            if self.i >= self.n or self.s[self.i] == "\n":
+                self.fail_at(line, "unterminated string")
+            ch = self.s[self.i]
+            if ch == "'":
+                self.i += 1
+                return "".join(out)
+            self.forbid_control(ch)
+            out.append(ch)
+            self.i += 1
+
+    def multiline_literal(self):
+        line = self.line()
+        self.i += 3
+        if self.peek() == "\n":
+            self.i += 1
+        out = []
+        while True:
+            if self.i >= self.n:
+                self.fail_at(line, "unterminated multi-line string")
+            if self.starts("'''"):
+                self.i += 3
+                if self.peek() == "'":
+                    self.fail_at(line, "a multi-line string ending in a quote is "
+                                       "not supported here")
+                return "".join(out)
+            ch = self.s[self.i]
+            self.forbid_control(ch, allow_newline=True)
+            out.append(ch)
+            self.i += 1
+
+    def skip_array_space(self):
+        while self.i < self.n:
+            ch = self.s[self.i]
+            if ch in " \t\n":
+                self.i += 1
+            elif ch == "#":
+                self.skip_comment()
+            else:
+                return
+
+    def array(self):
+        line = self.line()
+        self.i += 1
+        items = []
+        after_comma = True
+        while True:
+            self.skip_array_space()
+            if self.i >= self.n:
+                self.fail_at(line, "unterminated array")
+            if self.peek() == "]":
+                self.i += 1
                 break
-    if end == -1:
-        raise ValueError(
-            "line %d: unterminated array (multi-line arrays are not supported, "
-            "keep it on one line)" % lineno)
-    body = val[1:end].strip()
-    if not body:
-        return []
-    items, cur_item, in_str = [], "", False
-    for pos, ch in enumerate(body):
-        if ch == '"' and (pos == 0 or body[pos - 1] != "\\"):
-            in_str = not in_str
-            cur_item += ch
-        elif ch == "," and not in_str:
-            items.append(cur_item)
-            cur_item = ""
-        else:
-            cur_item += ch
-    items.append(cur_item)
-    return [_parse_scalar(x, lineno) for x in items if x.strip()]
+            if not after_comma:
+                self.fail("expected , between array items")
+            if self.peek() == "[":
+                self.fail("a nested array is not supported here")
+            items.append(self.value())
+            self.skip_array_space()
+            after_comma = self.peek() == ","
+            if after_comma:
+                self.i += 1
+        kinds = set(("bool" if v is True or v is False else type(v).__name__)
+                    for v in items)
+        if len(kinds) > 1:
+            self.fail_at(line, "an array of mixed types is not supported here")
+        return items
 
 
 def _parse_minimal_toml(text):
-    data = {}
-    cur = data
-    lines = text.splitlines()
-    i = 0
-    while i < len(lines):
-        raw = lines[i]
-        line = raw.strip()
-        i += 1
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("[") and line.endswith("]"):
-            name = line[1:-1].strip()
-            cur = data.setdefault(name, {})
-            continue
-        if "=" not in line:
-            raise ValueError("line %d: expected key = value: %r" % (i, raw))
-        key, _, val = line.partition("=")
-        key = key.strip()
-        val = val.strip()
-        if val.startswith('"""'):
-            body = val[3:]
-            if body.endswith('"""') and len(body) >= 3:
-                cur[key] = body[:-3]
-                continue
-            parts = [body] if body else []
-            while i < len(lines):
-                l2 = lines[i]
-                i += 1
-                if l2.rstrip().endswith('"""'):
-                    parts.append(l2.rstrip()[:-3])
-                    break
-                parts.append(l2)
-            else:
-                raise ValueError("unterminated multi-line string for %r" % key)
-            cur[key] = "\n".join(parts).lstrip("\n")
-            continue
-        if val.startswith('"'):
-            # Walk it rather than searching: a closing quote is one that is not
-            # itself escaped, and counting backslashes backwards gets that wrong
-            # for a string ending in a literal backslash.
-            end, j = -1, 1
-            while j < len(val):
-                if val[j] == "\\":
-                    j += 2
-                    continue
-                if val[j] == '"':
-                    end = j
-                    break
-                j += 1
-            if end == -1:
-                raise ValueError("line %d: unterminated string" % i)
-            cur[key] = _unescape(val[1:end])
-            continue
-        if val.startswith("["):
-            cur[key] = _parse_array(val, i)
-            continue
-        cur[key] = _parse_scalar(val, i)
-    return data
+    return _Toml(text).parse()
 
 
 def load_toml(path):
+    """The one reader, whatever the interpreter. See the note above."""
     with open(path, "rb") as f:
         raw = f.read()
-    try:
-        import tomllib  # 3.11+
-    except ImportError:
-        tomllib = None
-    if tomllib is not None:
-        return tomllib.loads(raw.decode("utf-8"))
     return _parse_minimal_toml(raw.decode("utf-8"))
 
 
@@ -1351,8 +1582,20 @@ def load_games(games_dir=GAMES_DIR):
         return games
     for entry in sorted(os.listdir(games_dir)):
         toml_path = os.path.join(games_dir, entry, "game.toml")
-        if os.path.isfile(toml_path):
-            games.append(Game(toml_path, load_toml(toml_path)))
+        if not os.path.isfile(toml_path):
+            continue
+        try:
+            data = load_toml(toml_path)
+        except (ValueError, OSError, UnicodeDecodeError) as exc:
+            # One pack's manifest is one pack's problem. Taking the catalogue
+            # down with it hides every other game behind a traceback, and the
+            # reader cannot even see which manifest was at fault.
+            game = Game(toml_path, {"game": {"id": entry, "name": entry,
+                                             "status": "wip"}})
+            game.errors = ["this manifest could not be read: %s" % exc]
+            games.append(game)
+            continue
+        games.append(Game(toml_path, data))
     # rc first, then playable, then wip; stable within a group
     order = {s: i for i, s in enumerate(STATUSES)}
     games.sort(key=lambda g: order.get(g.status, 99))
