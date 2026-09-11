@@ -39,6 +39,28 @@ def have_artifacts():
     return all(os.path.isfile(os.path.join(INSTALLED, src)) for src, _ in NEEDED)
 
 
+def fingerprint(root):
+    """Every path under `root` with its mode, size, mtime and contents.
+
+    Reading a file moves atime, not mtime, so a preflight that only looks at a
+    bottle leaves this identical. A write, a new file, a removed one or a
+    stripped attribute all show up as a difference.
+    """
+    out = {}
+    for base, dirs, files in os.walk(root):
+        dirs.sort()
+        for name in sorted(dirs) + sorted(files):
+            full = os.path.join(base, name)
+            st = os.lstat(full)
+            body = b""
+            if os.path.isfile(full) and not os.path.islink(full):
+                with open(full, "rb") as fh:
+                    body = fh.read()
+            out[os.path.relpath(full, root)] = (st.st_mode, st.st_size,
+                                                st.st_mtime_ns, body)
+    return out
+
+
 def wineserver_running():
     return subprocess.call(["pgrep", "-q", "-f", "wineserver"],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
@@ -77,6 +99,69 @@ class Preflight(unittest.TestCase):
         self.run_setup("--preflight")
         self.assertEqual(os.listdir(self.home), [],
                          "--preflight must answer without building anything")
+
+    def _pgrep_that_finds_nothing(self):
+        """So preflight runs past the wineserver check to the sidecar probe.
+
+        This machine's own CrossOver wineserver is not ours to quit, and that
+        check sits before the probe - the one part of preflight that runs a
+        binary rather than reading a file.
+        """
+        binned = os.path.join(self.dir, "bin")
+        if not os.path.isdir(binned):
+            os.makedirs(binned)
+            stub = os.path.join(binned, "pgrep")
+            with open(stub, "w") as fh:
+                fh.write("#!/bin/sh\nexit 1\n")
+            os.chmod(stub, 0o755)
+        return binned + os.pathsep + os.environ.get("PATH", "")
+
+    def a_bottle(self, with_game=False):
+        """A CrossOver bottle shaped like the one preflight goes looking for."""
+        bottle = os.path.join(self.dir, "bottle")
+        steam = os.path.join(bottle, "drive_c", "Program Files (x86)", "Steam",
+                             "steamapps", "common", "Age of Empires IV")
+        os.makedirs(steam)
+        os.makedirs(os.path.join(bottle, "drive_c", "users", "crossover", "Documents"))
+        if with_game:
+            with open(os.path.join(steam, "RelicCardinal.exe"), "wb") as fh:
+                fh.write(b"MZ, but not the build the Wine patch is wired to")
+        with open(os.path.join(bottle, "system.reg"), "w") as fh:
+            fh.write("WINE REGISTRY Version 2\n")
+        with open(os.path.join(bottle, "cxbottle.conf"), "w") as fh:
+            fh.write("[Bottle]\n")
+        return bottle
+
+    def test_preflight_leaves_the_crossover_bottle_alone(self):
+        """The other half of the rule: nothing outside the unpacked pack.
+
+        Choosing between clone and fresh means reading someone's bottle -
+        walking its users' folders, hashing the game exe in it. A bottle is not
+        ours and is not backed up, and at this point the person has only asked
+        whether the pack could be installed, not agreed to install it.
+
+        No game exe here, so the build-hash check has nothing to refuse and
+        preflight runs all the way through, sidecar probe included.
+        """
+        bottle = self.a_bottle()
+        before = fingerprint(bottle)
+        rc, out, err = self.run_setup("--preflight", AOE4_BOTTLE=bottle,
+                                      PATH=self._pgrep_that_finds_nothing())
+        self.assertEqual(rc, 0, err)
+        self.assertIn("satoru: mode=", out, "preflight stopped early, so this proved little")
+        self.assertEqual(fingerprint(bottle), before,
+                         "preflight modified the bottle it was only asked to read")
+
+    def test_refusing_does_not_tidy_the_bottle_on_the_way_out(self):
+        """The refusal path is where a script is most tempted to fix things."""
+        bottle = self.a_bottle(with_game=True)
+        before = fingerprint(bottle)
+        rc, _, err = self.run_setup("--preflight", AOE4_BOTTLE=bottle,
+                                    PATH=self._pgrep_that_finds_nothing())
+        self.assertEqual(rc, 10, err)
+        self.assertIn("RelicCardinal.exe sha256", err)
+        self.assertEqual(fingerprint(bottle), before,
+                         "preflight wrote to the bottle while refusing")
 
     def test_an_incomplete_pack_is_exit_12_not_a_generic_failure(self):
         os.remove(os.path.join(self.pack, "Helpers", "x87sidecar"))
@@ -317,6 +402,163 @@ class CloneIsIdempotent(unittest.TestCase):
         _, out, _ = self.run_setup()
         self.assertIn("Prefix " + self.prefix + " already exists", out)
 
+
+
+@unittest.skipUnless(os.path.isfile(os.path.join(PACK_SRC, "tools", "make-pack.sh")),
+                     "needs the aoe4 submodule")
+class VersionIsInOnePlace(unittest.TestCase):
+    """The pack's version may be written down exactly once.
+
+    It used to live in four places - game.toml, bootstrap.sh, README.md and
+    INSTALL.md - and nothing compared them. Cutting v0.2 would have shipped a
+    bootstrap that downloads v0.1, and docs that name a file nobody published.
+    The checker defends the invariant that makes that impossible: only
+    game.toml may name a release.
+    """
+
+    CHECK = os.path.join(PACK_SRC, "tools", "check-version.sh")
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def write(self, name, text):
+        full = os.path.join(self.dir, name)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w") as fh:
+            fh.write(text)
+
+    def check(self, version="v0.2"):
+        proc = subprocess.Popen(["bash", self.CHECK, version, self.dir],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = proc.communicate(timeout=60)
+        return (proc.returncode, out.decode("utf-8", "replace"),
+                err.decode("utf-8", "replace"))
+
+    def test_a_pack_that_names_no_release_outside_the_manifest_passes(self):
+        self.write("game.toml", 'version = "v0.1"\n'
+                   'url = "https://example.invalid/releases/download/v0.1/p.tar.gz"\n')
+        self.write("README.md", "# dxmt-aoe4-pack - Age of Empires IV\n")
+        rc, _, err = self.check()
+        self.assertEqual(rc, 0, err)
+
+    def test_the_manifest_may_still_point_at_the_previous_release(self):
+        """Rule one: the release is cut first, the manifest follows it.
+
+        So while v0.2 is being built, game.toml legitimately still says v0.1.
+        A checker that refused that would forbid the correct order.
+        """
+        self.write("game.toml", 'version = "v0.1"\nsha256 = "0540919b"\n')
+        rc, _, err = self.check(version="v0.2")
+        self.assertEqual(rc, 0, err)
+
+    def test_a_stale_tarball_name_in_the_docs_refuses_the_build(self):
+        self.write("game.toml", 'version = "v0.1"\n')
+        self.write("INSTALL.md", "Download `dxmt-aoe4-pack-v0.1.tar.gz` from Releases.\n")
+        rc, _, err = self.check(version="v0.2")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("INSTALL.md", err)
+
+    def test_a_second_download_url_outside_the_manifest_refuses_the_build(self):
+        self.write("game.toml", 'version = "v0.1"\n')
+        self.write("bootstrap.sh",
+                   'URL="https://example.invalid/releases/download/v0.1/p.tar.gz"\n')
+        rc, _, err = self.check(version="v0.2")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("bootstrap.sh", err)
+
+    def test_a_version_belonging_to_something_else_is_not_the_pack_version(self):
+        """setup.sh greps the DXMT build stamp `v0.80-`; that is not a release."""
+        self.write("game.toml", 'version = "v0.1"\n')
+        self.write("setup.sh", "strings d3d12.dll | grep -m1 'v0.80-'\n")
+        self.write("THIRD_PARTY.md", "CrossOver 26.3 / Wine 11.0\n")
+        rc, _, err = self.check(version="v0.2")
+        self.assertEqual(rc, 0, err)
+
+
+@unittest.skipUnless(os.path.isfile(os.path.join(PACK_SRC, "tools", "make-pack.sh")),
+                     "needs the aoe4 submodule")
+class WhatTheTarballCarries(unittest.TestCase):
+    """Two things the release must not carry, checked on a real build.
+
+    The payload here is a handful of stand-in files, not the 401 MB engine: what
+    is under test is which paths survive staging, and that does not depend on
+    the bytes inside them.
+    """
+
+    MAKE = os.path.join(PACK_SRC, "tools", "make-pack.sh")
+    EXEC = "#!/bin/sh\necho supported\n"
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.artifacts = os.path.join(self.dir, "artifacts")
+        for rel, body, mode in (
+                ("Engine/bin/wine", self.EXEC, 0o755),
+                ("Engine/lib/wine/x86_64-unix/ntdll.so", "", 0o644),
+                # The ballast: 19 MB of these ride along in the real engine.
+                ("Engine/lib/wine/x86_64-windows/libkernel32.a", "", 0o644),
+                ("Helpers/x87sidecar", self.EXEC, 0o755),
+                ("deps/libgnutls.30.dylib", "", 0o644),
+                ("deps/libinotify.dylib", "", 0o644),
+                ("dxmt/x86_64-windows/d3d12.dll", "", 0o644)):
+            full = os.path.join(self.artifacts, rel)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w") as fh:
+                fh.write(body)
+            os.chmod(full, mode)
+        self.out = os.path.join(self.dir, "dist")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def build(self, version="v0.2"):
+        env = dict(os.environ)
+        # Point the build's own preflight at a bottle that is not one, so it
+        # answers from the checks instead of walking this machine's CrossOver
+        # bottles and hashing a real game exe. Any answer but 2 or 127 is fine
+        # by the gate, which is what the build is asking about.
+        env["AOE4_BOTTLE"] = os.path.join(self.dir, "not-a-bottle")
+        proc = subprocess.Popen(["bash", self.MAKE, self.artifacts, version, self.out],
+                                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = proc.communicate(timeout=300)
+        return (proc.returncode, out.decode("utf-8", "replace"),
+                err.decode("utf-8", "replace"))
+
+    def entries(self, version="v0.2"):
+        rc, out, err = self.build(version)
+        self.assertEqual(rc, 0, err or out)
+        tarball = os.path.join(self.out, "dxmt-aoe4-pack-%s.tar.gz" % version)
+        self.assertTrue(os.path.isfile(tarball), out)
+        listing = subprocess.check_output(["tar", "tzf", tarball])
+        return listing.decode("utf-8", "replace").splitlines()
+
+    def test_no_static_libraries_ride_along(self):
+        """503 of these, 19 MB, and nothing at runtime opens one."""
+        names = self.entries()
+        self.assertFalse([n for n in names if n.endswith(".a")],
+                         "build-time import libraries shipped to users")
+
+    def test_the_downloader_does_not_ship_inside_what_it_downloads(self):
+        names = self.entries()
+        self.assertNotIn("dxmt-aoe4-pack/bootstrap.sh", names,
+                         "a bootstrap inside the tarball has nothing to fetch and goes stale")
+
+    def test_the_build_tooling_does_not_ship_either(self):
+        """What builds a release is not part of it."""
+        names = self.entries()
+        self.assertFalse([n for n in names if "/tools/" in n],
+                         "the pack's build scripts shipped to users")
+
+    def test_the_pack_itself_is_still_there(self):
+        """The prune must take the ballast and nothing else."""
+        names = self.entries()
+        for needed in ("dxmt-aoe4-pack/setup.sh",
+                       "dxmt-aoe4-pack/game.toml",
+                       "dxmt-aoe4-pack/Engine/bin/wine",
+                       "dxmt-aoe4-pack/Helpers/x87sidecar"):
+            self.assertIn(needed, names)
 
 if __name__ == "__main__":
     unittest.main()
