@@ -522,6 +522,15 @@ def parse_manifest(data):
             % (contract, CONTRACT))
     m["contract"] = contract
 
+    if contract == 0 and any(k in data for k in ("source", "requires", "install",
+                                                 "commands", "paths")):
+        # One forgotten line otherwise turns a correct v1 manifest into a handful
+        # of "unknown section" errors that accuse the very sections the author
+        # copied out of the contract.
+        errors.append(
+            "this looks like a contract 1 manifest but has no `contract = 1` "
+            "line, so it is being read as the older shape")
+
     if contract == 0:
         game = data.get("game", {})
         known = _take(game, _LEGACY_KEYS, errors, "[game]")
@@ -1051,8 +1060,13 @@ def _github_api_url(source):
     return "https://api.github.com/repos/%s/%s/releases/latest" % (rest[0], rest[1])
 
 
-def shim_text(paths, manifest):
-    """The script, as text. Returns "" for a pack that declares no way to launch."""
+def shim_text(paths, manifest, check_updates=True):
+    """The script, as text. Returns "" for a pack that declares no way to launch.
+
+    check_updates is the config switch. It was documented, parsed and ignored,
+    which is the worst shape a setting can take: the person who turns it off for
+    privacy, for an offline machine or for GitHub's rate limit is told it worked.
+    """
     game = manifest["game"]
     name, game_id = game["name"], game["id"]
     launch = (manifest["commands"] or {}).get("launch") or ""
@@ -1099,8 +1113,17 @@ def shim_text(paths, manifest):
     add('export DXMT_SHADER_CACHE_PATH=%s' % shlex.quote(paths.shader_cache(name) + "/"))
     add('export SATORU_GAME_HOME="$HERE"')
     add("export SATORU_GAME_ID=%s" % shlex.quote(game_id))
+    # The contract names one environment, not one for installing and a thinner
+    # one for launching. An author who writes "$SATORU_LOGS/game.log" in a launch
+    # command had it work at install time and vanish here, which shows up as an
+    # empty log and no explanation.
+    add("export SATORU_LIBRARY=%s" % shlex.quote(paths.library))
+    add("export SATORU_CACHE=%s" % shlex.quote(paths.game_cache(game_id)))
+    add("mkdir -p %s 2>/dev/null || true" % shlex.quote(paths.game_logs(game_id)))
+    add("export SATORU_LOGS=%s" % shlex.quote(paths.game_logs(game_id)))
+    add("export SATORU_CONTRACT=%s" % shlex.quote(str(CONTRACT)))
     add("")
-    if api:
+    if api and check_updates:
         add("# Update check. Started detached and never waited for: the game starts now and")
         add("# the answer is read by the launcher on some later run. Offline, a rate-limited")
         add("# API or a broken marker all cost exactly nothing here.")
@@ -1126,10 +1149,27 @@ def shim_text(paths, manifest):
     return "\n".join(out)
 
 
-def write_shim(paths, manifest, write=True):
+def newer_version(paths, game_id):
+    """The tag the shim's update check found, or None.
+
+    The check has been running since the shim was written, spending one of
+    GitHub's sixty calls an hour to leave its answer in a file. Nothing read it,
+    which made the whole feature a cost with no benefit, and made the line the
+    contract promises - "there is a v0.2" - something no user could ever see.
+    """
+    marker = os.path.join(paths.game_cache(game_id), "update-check")
+    try:
+        with open(marker, encoding="utf-8") as fh:
+            tag = fh.read().strip()
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    return tag or None
+
+
+def write_shim(paths, manifest, write=True, check_updates=True):
     """Write the shim into the game's home. Returns its path, or None if the pack
     declares no launch command (a work-in-progress pack, honestly)."""
-    text = shim_text(paths, manifest)
+    text = shim_text(paths, manifest, check_updates=check_updates)
     if not text:
         return None
     if not write:
@@ -1247,7 +1287,7 @@ def _clean_up_after(paths, name):
 
 
 def install_game(manifest, paths, probe=None, runner=None, fetch=None, unpack=None,
-                 unquarantine=None, on_output=None):
+                 unquarantine=None, on_output=None, check_updates=True):
     """Install a game, in the one order that makes each failure cheap.
 
     Requirements first, so a machine that cannot run the game never spends
@@ -1311,12 +1351,19 @@ def install_game(manifest, paths, probe=None, runner=None, fetch=None, unpack=No
         "SATORU_CONTRACT": str(CONTRACT),
     })
 
+    # 11 is the contract's word for "there is nothing here to do", and an install
+    # asked to run twice is the case it exists for. Treating it as a failure
+    # punishes the one author who read the exit codes and believed them.
+    nothing_to_do = False
+
     preflight = commands.get("preflight")
     if preflight:
         said = []
         code = runner.run(preflight, cwd=unpacked, env=env,
                           on_output=_recorder(said, on_output))
-        if code != 0:
+        if code == 11:
+            nothing_to_do = True
+        elif code != 0:
             # Nothing has been written yet, and nothing should be: leaving a
             # half-built home is what this whole ordering exists to prevent.
             reason, message = explain_exit(code, preflight, said)
@@ -1334,9 +1381,11 @@ def install_game(manifest, paths, probe=None, runner=None, fetch=None, unpack=No
     if not os.path.isdir(home):
         os.makedirs(home)
     said = []
-    code = runner.run(install, cwd=unpacked, env=env,
-                      on_output=_recorder(said, on_output))
-    if code != 0:
+    code = 11 if nothing_to_do else runner.run(
+        install, cwd=unpacked, env=env, on_output=_recorder(said, on_output))
+    if code == 11:
+        nothing_to_do = True
+    elif code != 0:
         reason, message = explain_exit(code, install, said)
         leftovers = _clean_up_after(paths, name)
         if leftovers:
@@ -1352,8 +1401,13 @@ def install_game(manifest, paths, probe=None, runner=None, fetch=None, unpack=No
     # true. Recorded first, a shim that fails to write - a full disk, a read-only
     # volume - leaves the state file saying installed while the launcher looks for
     # a launch script that is not there and says the opposite.
-    write_shim(paths, manifest)
+    write_shim(paths, manifest, check_updates=check_updates)
     entry = record_install(paths, manifest, (source or {}).get("sha256"))
+    if nothing_to_do:
+        return _install_result(True, "done", reason="nothing-to-do",
+                       requirements=requirements, entry=entry,
+                       message="%s was already installed; nothing needed doing"
+                               % name)
     return _install_result(True, "done", reason="done", requirements=requirements,
                    entry=entry)
 
@@ -1549,7 +1603,12 @@ class Game(object):
 
     def _v1_action_state(self, key, paths=None):
         paths = paths or Paths()
-        home = paths.home(self.name)
+        # The home that was recorded, not one recomputed from today's display
+        # name: renaming a game in its manifest is a normal thing for an author
+        # to do, and it used to leave the install on disk with the launcher
+        # looking somewhere else and reporting it missing.
+        entry = installed_entry(paths, self.id)
+        home = (entry or {}).get("home") or paths.home(self.name)
         if key == "setup":
             if not self.source or not self.source.get("url"):
                 # An honest "there is no automatic install", not a broken manifest.
@@ -1621,7 +1680,8 @@ def _install_via_umbrella(game, paths):
         sys.stdout.write("  " + line + "\n")
         sys.stdout.flush()
 
-    result = install_game(game.manifest, paths, on_output=echo)
+    result = install_game(game.manifest, paths, on_output=echo,
+                          check_updates=load_config(paths.config_file)["check_updates"])
     if result["ok"]:
         # Not "it is in Spotlight now": nothing here writes Info.plist yet, so
         # what is on disk is a directory named .app that Finder shows as broken.
@@ -1695,7 +1755,7 @@ def run_action(game, key):
 # ----------------------------------------------------------------------------
 # plain mode
 
-def describe(games, out=sys.stdout):
+def describe(games, out=sys.stdout, paths=None):
     if not games:
         out.write(NO_GAMES_HINT % GAMES_DIR)
         return
@@ -1707,6 +1767,12 @@ def describe(games, out=sys.stdout):
                   % (", ".join(absent), "" if len(absent) == 1 else "s"))
     for g in games:
         out.write("%s [%s] — %s\n" % (g.name, g.id, STATUS_LABEL.get(g.status, g.status)))
+        # Every manifest writes one, and until now no reader had ever seen it.
+        if g.summary:
+            out.write("    %s\n" % g.summary)
+        newer = newer_version(paths or current_paths(), g.id)
+        if newer:
+            out.write("    %-32s %s\n" % ("Update available", newer))
         for key, label, _ in ACTIONS:
             state, detail = g.action_state(key)
             if state == "ok":
@@ -1826,6 +1892,17 @@ def tui(stdscr, games):
                     put(y, 3, "%-32s · missing: %s" % (label, detail), attr | dim)
                 y += 1
             y += 1
+            if g.manual_url:
+                put(y, 3, "%-32s %s" % ("Instructions", g.manual_url), dim)
+                y += 1
+            if g.foreign_note:
+                # The one place the contract lets a pack say it writes outside
+                # its own home. It reached only the reader who ran --plain, which
+                # is the wrong half of the audience for a warning.
+                put(y, 3, "%-32s %s" % ("Note", g.foreign_note), curses.A_BOLD)
+                y += 1
+            if g.manual_url or g.foreign_note:
+                y += 1
             if g.notes:
                 put(y, 1, "Notes", curses.A_BOLD)
                 y += 1

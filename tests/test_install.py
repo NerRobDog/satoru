@@ -184,9 +184,9 @@ class TheLastTwoSteps(Harness):
         seen = {}
         real = satoru.write_shim
 
-        def spy(paths, manifest):
+        def spy(paths, manifest, **kw):
             seen["recorded"] = satoru.installed_entry(paths, "aoe4") is not None
-            return real(paths, manifest)
+            return real(paths, manifest, **kw)
 
         satoru.write_shim = spy
         try:
