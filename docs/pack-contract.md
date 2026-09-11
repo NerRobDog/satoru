@@ -150,7 +150,8 @@ output — usually it means a release older than the manifest pointing at it.
 ```
 Install
   [requires] → download + verify → unpack into the cache → strip quarantine
-            → preflight (WRITES NOTHING) → install → shim → record installed.toml
+            → preflight (WRITES NOTHING INTO THE HOME) → install → shim
+            → record installed.toml
             → bundle [planned]
 
 Launch
@@ -171,9 +172,21 @@ Uninstall [planned]
 The shim is written before the state, which is not decoration: `installed.toml`
 is a claim, and the shim is what makes it true.
 
-**Rule:** `preflight` writes nothing. Splitting your checks from your work is the
-main change a pack needs. AoE4's `setup.sh` used to die on a probe after copying
-420 MB, leaving half a home behind.
+**Rule:** `preflight` writes nothing into `SATORU_GAME_HOME`, and touches nothing
+outside the unpacked pack. Splitting your checks from your work is the main
+change a pack needs. AoE4's `setup.sh` used to die on a probe after copying
+420 MB, leaving half a home behind — the refusal has to cost nothing, so that
+what a refusal leaves behind is nothing.
+
+The unpacked pack itself is yours. It sits in `SATORU_CACHE`, which this contract
+declares erasable, and `unpack` replaces it wholesale on every install, so
+nothing you do there survives to confuse the next run. Use that: AoE4's preflight
+clears the quarantine flag from its own `Helpers/x87sidecar` before probing it,
+because an ad-hoc-signed binary that still carries the flag is killed by
+Gatekeeper rather than answering. satoru already strips quarantine from the whole
+pack before calling you, so that line does nothing under the umbrella — it is
+there for the person who downloaded the tarball in a browser and ran `setup.sh`
+by hand, who has nobody to do it for them.
 
 **Rule:** never update a pack while its game is running, and never between the
 moment someone presses launch and the moment the game is up.
