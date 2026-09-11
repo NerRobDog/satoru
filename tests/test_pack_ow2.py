@@ -19,6 +19,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 from support import satoru  # noqa: F401  (kept for consistency with the suite)
@@ -28,8 +29,9 @@ def fingerprint(root):
     """Every path under `root` with its mode, size, mtime and contents.
 
     Reading a file moves atime, not mtime, so a command that only looks at a
-    bottle leaves this identical. A write, a new file, a removed one or a
-    stripped attribute all show up as a difference.
+    bottle leaves this identical. A write, a new file and a removed one all show
+    up as a difference. Extended attributes do not: st_mode covers permissions,
+    not xattrs, so a stripped quarantine flag passes unnoticed here.
     """
     out = {}
     for base, dirs, files in os.walk(root):
@@ -118,7 +120,12 @@ class PackCase(unittest.TestCase):
 
     # -- helpers ---------------------------------------------------------------
     def env(self):
-        env = dict(os.environ)
+        # Start from a clean environment, not the developer's: OW2_TARGET, CX_ROOT,
+        # OW2_PACK_HOME or CX_BOTTLE_PATH left over in a shell would quietly change
+        # what is under test, and the failure would only show up on someone else's
+        # machine.
+        env = {k: v for k, v in os.environ.items()
+               if k in ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "USER")}
         # satoru's logs live outside the home (~/Library/Logs/satoru/<id>), so the
         # fixture keeps them apart too: with both pointing at the same directory,
         # a pack that logged to the wrong one would look correct here.
@@ -234,6 +241,54 @@ class PackCase(unittest.TestCase):
         self.assertTrue(os.path.isdir(self.home))
         self.assertEqual(fingerprint(self.bottle), before)
 
+    def test_uninstall_finds_a_bottle_a_killed_plain_run_left_stripped(self):
+        self.run_pack("bash", "setup.sh")
+        original_backend = "d3dmetal"
+        conf = os.path.join(self.bottle, "cxbottle.conf")
+        stale = conf + ".dxmt-ow2-pack.plain"
+        shutil.copyfile(conf, stale)
+        subprocess.call(["python3", os.path.join(self.home, "cxenv.py"), "unset", conf,
+                         "WINEDLLPATH", "WINEDLLOVERRIDES", "DXMT_CONFIG_FILE",
+                         "DXMT_LOG_PATH", "DXMT_USE_DEFAULT_METAL_CACHE",
+                         "DXMT_METALFX_SPATIAL_SWAPCHAIN", "DXMT_LOG_LEVEL"])
+        subprocess.call(["python3", os.path.join(self.home, "cxenv.py"), "set", conf,
+                         "CX_GRAPHICS_BACKEND=" + original_backend])
+
+        code, out = self.run_pack("bash", "uninstall.sh")
+        self.assertEqual(code, 0, out)
+        # The bottle started out on d3dmetal, so that is what it gets back — from the
+        # install-time backup, not from whatever --plain happened to inject.
+        self.assertIn('"CX_GRAPHICS_BACKEND" = "d3dmetal"', self.conf_text())
+        self.assertNotIn("WINEDLLPATH", self.conf_text())
+        self.assertFalse(os.path.exists(stale))
+        self.assertFalse(os.path.exists(conf + ".dxmt-ow2-pack.bak"))
+
+    def test_uninstall_keeps_what_the_person_changed_since_installing(self):
+        self.run_pack("bash", "setup.sh")
+        conf = os.path.join(self.bottle, "cxbottle.conf")
+        subprocess.call(["python3", os.path.join(self.home, "cxenv.py"), "set", conf,
+                         "MTL_HUD_ENABLED=1"])
+        code, out = self.run_pack("bash", "uninstall.sh")
+        self.assertEqual(code, 0, out)
+        self.assertIn('"MTL_HUD_ENABLED" = "1"', self.conf_text(),
+                      "uninstall threw away a change that was not ours")
+        self.assertIn('"WINEMSYNC" = "1"', self.conf_text())
+        self.assertNotIn("WINEDLLPATH", self.conf_text())
+
+    def test_uninstall_refuses_a_home_that_is_not_a_pack_home(self):
+        # SATORU_GAME_HOME comes from outside; a typo in it must not cost someone a
+        # directory of their own.
+        stranger = os.path.join(self.dir, "not-ours")
+        os.makedirs(stranger)
+        with open(os.path.join(stranger, "thesis.txt"), "w") as fh:
+            fh.write("years of work\n")
+        env = dict(self.env(), SATORU_GAME_HOME=stranger)
+        proc = subprocess.Popen(["bash", "uninstall.sh"], cwd=self.pack, env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        out, _ = proc.communicate(timeout=120)
+        self.assertIn(proc.returncode, (10, 11), out.decode())
+        self.assertTrue(os.path.exists(os.path.join(stranger, "thesis.txt")))
+
     def test_uninstalling_nothing_is_eleven(self):
         code, out = self.run_pack("bash", "uninstall.sh")
         self.assertEqual(code, 11, out)
@@ -314,6 +369,118 @@ class PackCase(unittest.TestCase):
         self.assertEqual(self.conf_text(), wired)
         self.assertFalse(os.path.exists(
             os.path.join(self.bottle, "cxbottle.conf.dxmt-ow2-pack.plain")))
+
+    def test_the_launcher_outlives_the_unpacked_pack(self):
+        # satoru unpacks into SATORU_CACHE, which the contract calls erasable and
+        # which the next install replaces wholesale. A launcher that reached back
+        # into it would work until the first time anything was cleaned.
+        self.run_pack("bash", "setup.sh")
+        shutil.rmtree(self.pack)
+        code, out = self.run_pack("bash", os.path.join(self.home, "ow2.sh"),
+                                  "--dry-run", cwd=self.home)
+        self.assertEqual(code, 0, out)
+        self.assertIn("backend: dxmt", out)
+        self.assertIn(os.path.join(self.home, "dxmt"), out,
+                      "the launcher could not read the config it wired up")
+
+    def test_a_killed_plain_run_is_undone_by_the_next_launch(self):
+        # A --plain run that dies before its trap leaves the bottle stripped and the
+        # good config in a .plain file. Taking a fresh backup over that file would
+        # save the stripped config as the thing to restore, and this pack's settings
+        # would be gone for good.
+        self.run_pack("bash", "setup.sh")
+        wired = self.conf_text()
+        stale = os.path.join(self.bottle, "cxbottle.conf.dxmt-ow2-pack.plain")
+        shutil.copyfile(os.path.join(self.bottle, "cxbottle.conf"), stale)
+        subprocess.call(["python3", os.path.join(self.home, "cxenv.py"), "unset",
+                         os.path.join(self.bottle, "cxbottle.conf"), "WINEDLLPATH",
+                         "WINEDLLOVERRIDES", "DXMT_CONFIG_FILE", "DXMT_LOG_PATH"])
+        subprocess.call(["python3", os.path.join(self.home, "cxenv.py"), "set",
+                         os.path.join(self.bottle, "cxbottle.conf"),
+                         "CX_GRAPHICS_BACKEND=d3dmetal"])
+        self.assertNotEqual(self.conf_text(), wired)
+
+        code, out = self.run_pack("bash", os.path.join(self.home, "ow2.sh"),
+                                  "--dry-run", cwd=self.home)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.conf_text(), wired, "the stripped config was not undone")
+        self.assertFalse(os.path.exists(stale))
+
+    def test_a_busy_bottle_is_refused_and_asked_about_correctly(self):
+        """The guard has to ask about the prefix root, by fd, tolerating truncation.
+
+        Everything about this check is counter-intuitive, and each part was wrong
+        once. wineserver holds the prefix ROOT open, not anything under drive_c.
+        lsof truncates COMMAND to nine characters, so "wineserver" prints as
+        "wineserve" and a grep for the full name never matches. And `lsof +D` on a
+        bottle with a 77 GB game in it walks the whole tree for minutes.
+
+        A stub lsof lets the test assert all three: that the answer is believed,
+        that the bottle root is what was asked about, and that +D was not used.
+        """
+        self.run_pack("bash", "setup.sh")
+        cx_root, _ = self.stub_crossover()
+        bindir = os.path.join(self.dir, "stub-bin")
+        os.makedirs(bindir)
+        argfile = os.path.join(self.dir, "lsof-args")
+        with open(os.path.join(bindir, "lsof"), "w") as fh:
+            fh.write('#!/bin/sh\n'
+                     'printf "%s\\n" "$*" >> "%s"\n'
+                     'echo "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME"\n'
+                     'echo "wineserve 999 nik 4r DIR 1,13 96 1 %s"\n' % ("%s", argfile, self.bottle))
+        os.chmod(os.path.join(bindir, "lsof"), 0o755)
+        env = dict(self.env(), CX_ROOT=cx_root,
+                   PATH=bindir + os.pathsep + os.environ.get("PATH", ""))
+        proc = subprocess.Popen(["bash", os.path.join(self.home, "ow2.sh")],
+                                cwd=self.home, env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        out, _ = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 10, out.decode())
+        self.assertIn("already running", out.decode())
+
+        with open(argfile) as fh:
+            asked = fh.read()
+        self.assertIn(self.bottle, asked)
+        self.assertNotIn("+D", asked, "the guard walks the bottle's whole tree")
+        self.assertNotIn("drive_c", asked, "the guard asks about drive_c, where "
+                                           "wineserver holds nothing")
+
+    @unittest.skipUnless(os.path.isfile(
+        "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wineserver"),
+        "CrossOver is not installed")
+    def test_the_guard_sees_a_real_wineserver(self):
+        """The same check, against the thing itself rather than a stub.
+
+        A wineserver started on the fixture prefix and killed afterwards. This is
+        the test that would have caught the original guard, which reported "free"
+        with a live session holding the bottle.
+        """
+        self.run_pack("bash", "setup.sh")
+        cx = "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver"
+        server = subprocess.Popen([os.path.join(cx, "bin", "wineserver"), "-p", "-f"],
+                                  env=dict(os.environ, WINEPREFIX=self.bottle),
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(server.kill)
+        try:
+            deadline = time.time() + 20
+            seen = False
+            while time.time() < deadline and not seen:
+                out = subprocess.run(["lsof", "--", self.bottle],
+                                     stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL).stdout
+                seen = b"wine" in out
+            if not seen:
+                self.skipTest("wineserver did not take hold of the fixture prefix")
+            cx_root, _ = self.stub_crossover()
+            proc = subprocess.Popen(["bash", os.path.join(self.home, "ow2.sh")],
+                                    cwd=self.home,
+                                    env=dict(self.env(), CX_ROOT=cx_root),
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            out, _ = proc.communicate(timeout=60)
+            self.assertEqual(proc.returncode, 10, out.decode())
+        finally:
+            server.kill()
+            server.wait()
 
     def test_plain_names_the_other_backend(self):
         self.run_pack("bash", "setup.sh")
