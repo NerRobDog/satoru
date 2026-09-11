@@ -253,6 +253,55 @@ class PackCase(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertIn("Overwatch.lnk", out)
 
+    def stub_crossover(self):
+        """A CrossOver that records what the config said when it was launched.
+
+        --plain is the one path that takes this pack's settings out of someone's
+        bottle, so the test has to see both halves: what the launcher hands to
+        CrossOver, and that the bottle is whole again afterwards. A stub is the
+        only way to watch that without starting a game.
+        """
+        cx = os.path.join(self.dir, "cx", "bin")
+        os.makedirs(cx)
+        seen = os.path.join(self.dir, "conf-at-launch")
+        with open(os.path.join(cx, "cxstart"), "w") as fh:
+            fh.write('#!/bin/sh\ncp "%s/cxbottle.conf" "%s"\nexit 3\n'
+                     % (self.bottle, seen))
+        for name in ("wine", "wineserver"):
+            with open(os.path.join(cx, name), "w") as fh:
+                fh.write("#!/bin/sh\nexit 0\n")
+        for name in ("cxstart", "wine", "wineserver"):
+            os.chmod(os.path.join(cx, name), 0o755)
+        return os.path.dirname(cx), seen
+
+    def test_plain_really_hands_crossover_the_other_backend(self):
+        self.run_pack("bash", "setup.sh")
+        cx_root, seen = self.stub_crossover()
+        env = dict(self.env(), CX_ROOT=cx_root)
+        proc = subprocess.Popen(["bash", os.path.join(self.home, "ow2.sh"), "--plain"],
+                                cwd=self.home, env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        out, _ = proc.communicate(timeout=120)
+        with open(seen) as fh:
+            at_launch = fh.read()
+        self.assertIn('"CX_GRAPHICS_BACKEND" = "d3dmetal"', at_launch, out.decode())
+        self.assertNotIn("WINEDLLPATH", at_launch,
+                         "plain left our DLL overrides in place, so it was not plain")
+
+    def test_a_failed_launch_still_gives_the_bottle_back(self):
+        # The stub exits 3. Someone's bottle must not be left stripped because a
+        # launch went wrong, or Ctrl-C landed in the wrong second.
+        self.run_pack("bash", "setup.sh")
+        wired = self.conf_text()
+        cx_root, _ = self.stub_crossover()
+        env = dict(self.env(), CX_ROOT=cx_root)
+        subprocess.Popen(["bash", os.path.join(self.home, "ow2.sh"), "--plain"],
+                         cwd=self.home, env=env, stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT).communicate(timeout=120)
+        self.assertEqual(self.conf_text(), wired)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.bottle, "cxbottle.conf.dxmt-ow2-pack.plain")))
+
     def test_plain_names_the_other_backend(self):
         self.run_pack("bash", "setup.sh")
         code, out = self.run_pack("bash", os.path.join(self.home, "ow2.sh"),
