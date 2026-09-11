@@ -119,8 +119,12 @@ class PackCase(unittest.TestCase):
     # -- helpers ---------------------------------------------------------------
     def env(self):
         env = dict(os.environ)
+        # satoru's logs live outside the home (~/Library/Logs/satoru/<id>), so the
+        # fixture keeps them apart too: with both pointing at the same directory,
+        # a pack that logged to the wrong one would look correct here.
         env.update(SATORU_GAME_HOME=self.home, SATORU_CONTRACT="1",
-                   SATORU_GAME_ID="ow2", SATORU_LOGS=os.path.join(self.home, "logs"),
+                   SATORU_GAME_ID="ow2",
+                   SATORU_LOGS=os.path.join(self.dir, "satoru-logs"),
                    OW2_BOTTLE=self.bottle)
         return env
 
@@ -189,6 +193,15 @@ class PackCase(unittest.TestCase):
         code, out = self.run_pack("bash", "setup.sh")
         self.assertEqual(code, 0, out)
         self.assertIn('"WINEDLLPATH" = "%s/dxmt"' % self.home, self.conf_text())
+
+    def test_the_logs_directory_the_manifest_promises_actually_exists(self):
+        # game.toml says [paths] logs = "logs", which satoru resolves inside the
+        # home. If the layer logged somewhere else, the launcher's "Open logs"
+        # would open nothing.
+        code, out = self.run_pack("bash", "setup.sh")
+        self.assertEqual(code, 0, out)
+        self.assertTrue(os.path.isdir(os.path.join(self.home, "logs")))
+        self.assertIn('"DXMT_LOG_PATH" = "%s/logs"' % self.home, self.conf_text())
 
     def test_install_removes_the_backend_that_would_inject_crossovers_own_dxmt(self):
         self.run_pack("bash", "setup.sh")
