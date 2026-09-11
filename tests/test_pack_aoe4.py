@@ -469,6 +469,63 @@ class VersionIsInOnePlace(unittest.TestCase):
         self.assertNotEqual(rc, 0)
         self.assertIn("bootstrap.sh", err)
 
+    def build_id(self, sha):
+        os.makedirs(os.path.join(self.dir, "Engine"), exist_ok=True)
+        with open(os.path.join(self.dir, "Engine", ".build-id"), "w") as fh:
+            fh.write(sha + "\n")
+
+    def test_attribution_must_name_the_engine_revision_that_was_built(self):
+        """LGPL: the source offer has to point at what was actually shipped.
+
+        The upper tree is pinned by the sha256 of the source tarball, which is
+        stronger than a commit. Our delta on top of it was pinned by nothing:
+        the attribution named a repository and no revision, and the binary
+        carries no stamp - neither bin/wine, a 27 KB loader, nor ntdll.so, where
+        the code actually is. .build-id is that stamp, and this keeps it honest.
+        """
+        self.write("game.toml", 'version = "v0.1"\n')
+        self.write("THIRD_PARTY.md",
+                   "our build: `https://github.com/NerRobDog/wine-aoe4`, commit "
+                   "`cf465d4bbe0fc0bdeeb1023a38bb98810901b547` |\n")
+        self.build_id("cf465d4bbe0fc0bdeeb1023a38bb98810901b547")
+        rc, _, err = self.check()
+        self.assertEqual(rc, 0, err)
+
+    def test_a_short_commit_in_the_attribution_is_enough(self):
+        self.write("game.toml", 'version = "v0.1"\n')
+        self.write("THIRD_PARTY.md", "our build: wine-aoe4, commit `cf465d4` |\n")
+        self.build_id("cf465d4bbe0fc0bdeeb1023a38bb98810901b547")
+        rc, _, err = self.check()
+        self.assertEqual(rc, 0, err)
+
+    def test_an_attribution_naming_a_different_revision_refuses_the_build(self):
+        """The failure this exists for: the engine moves, the credit does not."""
+        self.write("game.toml", 'version = "v0.1"\n')
+        self.write("THIRD_PARTY.md", "our build: wine-aoe4, commit `438b37c` |\n")
+        self.build_id("cf465d4bbe0fc0bdeeb1023a38bb98810901b547")
+        rc, _, err = self.check()
+        self.assertNotEqual(rc, 0)
+        self.assertIn("THIRD_PARTY.md", err)
+
+    def test_a_sha256_in_the_attribution_is_not_mistaken_for_a_revision(self):
+        """THIRD_PARTY.md is full of sha256 sums; none of them is a commit."""
+        self.write("game.toml", 'version = "v0.1"\n')
+        self.write("THIRD_PARTY.md",
+                   "source tarball sha256 "
+                   "`7be5819017b34f09670293f2be7ed9f4476734b8f42dab121a8b74e6619c92a8`, "
+                   "our build commit `cf465d4` |\n")
+        self.build_id("cf465d4bbe0fc0bdeeb1023a38bb98810901b547")
+        rc, _, err = self.check()
+        self.assertEqual(rc, 0, err)
+
+    def test_a_pack_without_a_build_id_is_not_refused(self):
+        """v0.1's payload carries none, and a checker that blocked on that would
+        make every older engine unbuildable. The build warns instead."""
+        self.write("game.toml", 'version = "v0.1"\n')
+        self.write("THIRD_PARTY.md", "our build: wine-aoe4 |\n")
+        rc, _, err = self.check()
+        self.assertEqual(rc, 0, err)
+
     def test_a_version_belonging_to_something_else_is_not_the_pack_version(self):
         """setup.sh greps the DXMT build stamp `v0.80-`; that is not a release."""
         self.write("game.toml", 'version = "v0.1"\n')
@@ -513,8 +570,11 @@ class WhatTheTarballCarries(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.dir, ignore_errors=True)
 
-    def build(self, version="v0.2"):
+    def build(self, version="v0.2", engine_commit=None):
         env = dict(os.environ)
+        env.pop("AOE4_ENGINE_COMMIT", None)
+        if engine_commit:
+            env["AOE4_ENGINE_COMMIT"] = engine_commit
         # Point the build's own preflight at a bottle that is not one, so it
         # answers from the checks instead of walking this machine's CrossOver
         # bottles and hashing a real game exe. Any answer but 2 or 127 is fine
@@ -526,8 +586,8 @@ class WhatTheTarballCarries(unittest.TestCase):
         return (proc.returncode, out.decode("utf-8", "replace"),
                 err.decode("utf-8", "replace"))
 
-    def entries(self, version="v0.2"):
-        rc, out, err = self.build(version)
+    def entries(self, version="v0.2", engine_commit=None):
+        rc, out, err = self.build(version, engine_commit)
         self.assertEqual(rc, 0, err or out)
         tarball = os.path.join(self.out, "dxmt-aoe4-pack-%s.tar.gz" % version)
         self.assertTrue(os.path.isfile(tarball), out)
@@ -550,6 +610,18 @@ class WhatTheTarballCarries(unittest.TestCase):
         names = self.entries()
         self.assertFalse([n for n in names if "/tools/" in n],
                          "the pack's build scripts shipped to users")
+
+    def test_the_engine_revision_travels_with_the_pack(self):
+        """So the tarball can answer what built it, and the attribution is checkable."""
+        env_sha = "cf465d4bbe0fc0bdeeb1023a38bb98810901b547"
+        names = self.entries(engine_commit=env_sha)
+        self.assertIn("dxmt-aoe4-pack/Engine/.build-id", names)
+
+    def test_a_build_with_no_recorded_revision_still_ships(self):
+        """The v0.1 engine predates the idea; refusing to package it helps nobody."""
+        rc, out, err = self.build()
+        self.assertEqual(rc, 0, err or out)
+        self.assertIn("no engine revision recorded", err)
 
     def test_the_pack_itself_is_still_there(self):
         """The prune must take the ballast and nothing else."""
