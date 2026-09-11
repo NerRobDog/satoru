@@ -73,7 +73,7 @@ version = "v0.1"                    # what an update check compares against
 arch    = "arm64"
 macos   = ">=26"
 rosetta = true
-disk_gb = 4                         # measured on the volume the home will land on
+disk_gb = 4                         # your own footprint, on the volume the home lands on
 tools   = []                        # magicka: ["dotnet", "ffmpeg", "gh"]
 
 [install]
@@ -96,6 +96,16 @@ logs    = "logs"                    # what "Open logs" opens
 `foreign_note` is the one place the contract lets a pack admit that it writes
 somewhere other than its own home. Use it. It is shown before anyone commits to
 installing.
+
+`disk_gb` is your own footprint and nothing else. Space for the game's own files
+belongs to whoever brings them: a pack that installs through a store leaves that
+to the store, which already refuses when the disk is full and says so. Only a
+pack that fetches the game itself owns that check, and it belongs in `preflight`
+with exit 10 — there is no manifest key for it, because a key that is empty for
+every pack but one makes the contract worse rather than better. If you write that
+check, its message must name the numbers: how much is free, how much is needed,
+and on which volume. "Not enough space" without them is a dead end rather than an
+instruction.
 
 If `kind = "none"` and `manual_url` is empty, your game appears as five greyed-out
 actions and no explanation, which reads as abandoned. That is why `manual_url` is
@@ -206,6 +216,23 @@ honestly and still cannot install the game. It cost us 139 MB and an
 Build the tarball with `COPYFILE_DISABLE=1`. Without it macOS `tar` writes an
 AppleDouble `._name` beside every entry whose file has extended attributes, and
 those extra top-level entries hide the pack's root directory.
+
+Two habits are worth copying rather than reinventing; the AoE IV pack has both,
+in `tools/`.
+
+The first keeps the release version in one place. Before it existed, that version
+lived in four, nothing compared them, and a bootstrap script that shipped inside
+the tarball would have carried a v0.2 release that downloaded v0.1. A check that
+the manifest is the only place the version appears costs a few lines and removes
+a whole shape of mistake.
+
+The second makes the rule at the top of this section mechanical instead of
+remembered: before building the tarball, run the staged pack's own `preflight`,
+taken from the manifest, and refuse to build when it answers with a code that
+says the pack does not understand its own commands. One detail matters when you
+port it — the gate may run **only** `preflight`, because that is the one command
+this contract promises writes nothing. A gate that runs `install` is not a gate;
+it is an installation on the build machine.
 
 ## State
 
