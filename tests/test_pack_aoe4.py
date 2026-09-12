@@ -25,8 +25,8 @@ PACK_SRC = os.path.join(ROOT, "games", "aoe4")
 INSTALLED = os.path.expanduser("~/aoe4-pack")
 
 NEEDED = [
-    ("deps/Frameworks/libgnutls.30.dylib", "deps/libgnutls.30.dylib"),
-    ("deps/Frameworks/libinotify.dylib", "deps/libinotify.dylib"),
+    ("deps/Frameworks/libgnutls.30.dylib", "deps/Frameworks/libgnutls.30.dylib"),
+    ("deps/Frameworks/libinotify.dylib", "deps/Frameworks/libinotify.dylib"),
     ("Helpers/x87sidecar", "Helpers/x87sidecar"),
     ("Engine/bin/wine", "Engine/bin/wine"),
     ("Engine/lib/wine/x86_64-unix/ntdll.so", "Engine/lib/wine/x86_64-unix/ntdll.so"),
@@ -557,8 +557,8 @@ class WhatTheTarballCarries(unittest.TestCase):
                 # The ballast: 19 MB of these ride along in the real engine.
                 ("Engine/lib/wine/x86_64-windows/libkernel32.a", "", 0o644),
                 ("Helpers/x87sidecar", self.EXEC, 0o755),
-                ("deps/libgnutls.30.dylib", "", 0o644),
-                ("deps/libinotify.dylib", "", 0o644),
+                ("deps/Frameworks/libgnutls.30.dylib", "", 0o644),
+                ("deps/Frameworks/libinotify.dylib", "", 0o644),
                 ("dxmt/x86_64-windows/d3d12.dll", "", 0o644)):
             full = os.path.join(self.artifacts, rel)
             os.makedirs(os.path.dirname(full), exist_ok=True)
