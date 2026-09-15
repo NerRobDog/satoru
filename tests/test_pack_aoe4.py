@@ -12,7 +12,9 @@ the contract declares erasable and which unpack replaces wholesale - so clearing
 the quarantine flag from the pack's own sidecar before probing it is allowed, and
 is what lets setup.sh answer at all when a person runs it by hand.
 """
+import hashlib
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -481,6 +483,7 @@ class UpdateIsInstallRunAgain(unittest.TestCase):
 
     STEAMAPPS = os.path.join("drive_c", "Program Files (x86)", "Steam", "steamapps")
     MANIFEST = "appmanifest_1466860.acf"
+    STEAM_EXE = "MZ, whatever Steam delivered"
 
     def setUp(self):
         self.dir = tempfile.mkdtemp()
@@ -505,6 +508,14 @@ class UpdateIsInstallRunAgain(unittest.TestCase):
         for name in ("dxmt.conf", "counters.py", "patch-profile.py", "aoe4.sh", "setup.sh"):
             shutil.copy2(os.path.join(PACK_SRC, name), os.path.join(self.pack, name))
         self.write(os.path.join(self.pack, "SHA256SUMS"), "pack one\n")
+        # The patch is wired to one exe build. The stand-in exe Steam "downloaded"
+        # into the prefix plays that build here, so only a test that writes a
+        # different one meets the refusal.
+        setup_copy = os.path.join(self.pack, "setup.sh")
+        self.write(setup_copy, re.sub(
+            r'^EXE_SHA_EXPECTED="[0-9a-f]+"',
+            'EXE_SHA_EXPECTED="%s"' % hashlib.sha256(self.STEAM_EXE.encode()).hexdigest(),
+            self.read(setup_copy), count=1, flags=re.M), 0o755)
 
         # pgrep: this machine's wineserver is not ours to stop. system_profiler:
         # slow, and the pacing it feeds is not under test. curl: Valve's
@@ -552,17 +563,16 @@ class UpdateIsInstallRunAgain(unittest.TestCase):
         self.assertEqual(rc, 0, out + err)
         return out
 
-    def a_games_library(self, manifest="the library's manifest\n"):
-        """~/Games/<bottle>/steamapps with a game exe of a build the patch is not wired to."""
+    def a_games_library(self, manifest="the library's manifest\n", exe="MZ, but not the build the Wine patch is wired to"):
+        """~/Games/<bottle>/steamapps, by default with a game exe of a build the patch is not wired to."""
         steamapps = os.path.join(self.user, "Games", "AoE4", "steamapps")
-        self.write(os.path.join(steamapps, "common", "Age of Empires IV", "RelicCardinal.exe"),
-                   "MZ, but not the build the Wine patch is wired to")
+        self.write(os.path.join(steamapps, "common", "Age of Empires IV", "RelicCardinal.exe"), exe)
         self.write(os.path.join(steamapps, self.MANIFEST), manifest)
         return steamapps
 
-    def steam_downloaded_the_game(self, manifest="Steam's own, newer\n"):
+    def steam_downloaded_the_game(self, manifest="Steam's own, newer\n", exe=None):
         self.write(os.path.join(self.prefix_steamapps, "common", "Age of Empires IV",
-                                "RelicCardinal.exe"), "MZ, whatever Steam delivered")
+                                "RelicCardinal.exe"), exe if exe is not None else self.STEAM_EXE)
         self.write(os.path.join(self.prefix_steamapps, self.MANIFEST), manifest)
 
     def read(self, path):
@@ -671,6 +681,20 @@ class UpdateIsInstallRunAgain(unittest.TestCase):
         self.assertEqual(rc, 0, "a different build under ~/Games refused an update:\n" + out + err)
         self.assertNotIn("reusing the Steam library", out)
 
+    def test_a_game_steam_updated_in_the_prefix_is_refused(self):
+        """The rerun no longer reads ~/Games, so the exe checked is the prefix's own."""
+        self.steam_downloaded_the_game(exe="MZ, a build Steam updated to")
+        rc, out, err = self.run_setup("--preflight")
+        self.assertEqual(rc, 10, out + err)
+        self.assertIn("RelicCardinal.exe sha256", err)
+
+    def test_a_finished_home_whose_game_was_updated_is_not_nothing_to_do(self):
+        self.steam_downloaded_the_game()
+        self.install()
+        self.steam_downloaded_the_game(exe="MZ, a build Steam updated to")
+        rc, out, err = self.run_setup("--preflight")
+        self.assertEqual(rc, 10, "an updated game answered %d, not 10:\n%s%s" % (rc, out, err))
+
     def test_a_rerun_over_steams_own_download_installs(self):
         self.steam_downloaded_the_game()
         self.a_games_library()
@@ -698,8 +722,8 @@ class UpdateIsInstallRunAgain(unittest.TestCase):
                          "Steam's own, newer\n")
 
     def test_a_rerun_over_the_library_linked_last_time_leaves_it_as_it_is(self):
-        """The link from the first install is the game; the library's exe is not re-judged."""
-        steamapps = self.a_games_library(manifest="the library's, from April\n")
+        """The link from the first install is the game, and it is the build the patch is wired to."""
+        steamapps = self.a_games_library(manifest="the library's, from April\n", exe=self.STEAM_EXE)
         os.symlink(os.path.join(steamapps, "common"), os.path.join(self.prefix_steamapps, "common"))
         self.write(os.path.join(self.prefix_steamapps, self.MANIFEST), "Steam updated it since\n")
         rc, out, err = self.run_setup("--preflight")
