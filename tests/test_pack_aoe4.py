@@ -74,6 +74,10 @@ class Preflight(unittest.TestCase):
         self.pack = os.path.join(self.dir, "pack")
         self.home = os.path.join(self.dir, "home")
         os.makedirs(self.home)
+        # A $HOME of its own: setup.sh looks for game files under ~/Games, and
+        # this machine's real library is neither ours to hash nor a fixture.
+        self.user = os.path.join(self.dir, "user")
+        os.makedirs(self.user)
         for src, dst in NEEDED:
             full = os.path.join(self.pack, dst)
             os.makedirs(os.path.dirname(full), exist_ok=True)
@@ -86,6 +90,7 @@ class Preflight(unittest.TestCase):
     def run_setup(self, *args, **env_extra):
         env = dict(os.environ)
         env["SATORU_GAME_HOME"] = self.home
+        env["HOME"] = self.user
         env.update(env_extra)
         proc = subprocess.Popen(
             ["bash", os.path.join(self.pack, "setup.sh")] + list(args),
@@ -117,7 +122,7 @@ class Preflight(unittest.TestCase):
         return binned + os.pathsep + os.environ.get("PATH", "")
 
     def a_bottle(self, with_game=False):
-        """A CrossOver bottle shaped like the one preflight goes looking for."""
+        """A prefix shaped like a CrossOver bottle - the kind AOE4_BOTTLE names."""
         bottle = os.path.join(self.dir, "bottle")
         steam = os.path.join(bottle, "drive_c", "Program Files (x86)", "Steam",
                              "steamapps", "common", "Age of Empires IV")
@@ -163,6 +168,39 @@ class Preflight(unittest.TestCase):
         self.assertEqual(fingerprint(bottle), before,
                          "preflight wrote to the bottle while refusing")
 
+    def a_games_library(self, bottle_name="Age of Empires IV Anniversary Edition"):
+        """A Steam library as moving a CrossOver bottle out left it: ~/Games/<bottle>/steamapps."""
+        steamapps = os.path.join(self.user, "Games", bottle_name, "steamapps")
+        game = os.path.join(steamapps, "common", "Age of Empires IV")
+        os.makedirs(game)
+        with open(os.path.join(game, "RelicCardinal.exe"), "wb") as fh:
+            fh.write(b"MZ, but not the build the Wine patch is wired to")
+        return steamapps
+
+    def test_game_files_under_games_are_found_without_being_told(self):
+        """No AOE4_STEAMAPPS, no bottle: the library under ~/Games is the one used.
+
+        The exe is found, so the build-hash check runs on it and refuses the
+        fake - which is how we know it was found, not skipped.
+        """
+        steamapps = self.a_games_library()
+        rc, out, err = self.run_setup("--preflight", PATH=self._pgrep_that_finds_nothing())
+        self.assertIn("Mode: fresh", out)
+        self.assertIn("reusing the Steam library at " + steamapps, out)
+        self.assertEqual(rc, 10, err)
+        self.assertIn("RelicCardinal.exe sha256", err)
+
+    def test_a_crossover_bottle_is_no_longer_looked_for(self):
+        """CrossOver is gone; nothing of this pack goes looking in its Bottles folder."""
+        bottles = os.path.join(self.user, "Library", "Application Support", "CrossOver", "Bottles")
+        os.makedirs(bottles)
+        shutil.move(self.a_bottle(with_game=True), os.path.join(bottles, "AoE"))
+        rc, out, err = self.run_setup("--preflight", PATH=self._pgrep_that_finds_nothing())
+        self.assertEqual(rc, 0, err)
+        self.assertIn("satoru: mode=fresh", out)
+        self.assertIn("satoru: game_files=download", out)
+        self.assertNotIn("satoru: bottle=", out)
+
     def test_an_incomplete_pack_is_exit_12_not_a_generic_failure(self):
         os.remove(os.path.join(self.pack, "Helpers", "x87sidecar"))
         rc, _, err = self.run_setup("--preflight")
@@ -182,7 +220,8 @@ class Preflight(unittest.TestCase):
         the whole thing: cloning a bottle, building a prefix, possibly fetching
         Steam - when what was asked was whether it could.
         """
-        rc, out, err = self.run_setup("--clone", "--preflight")
+        rc, out, err = self.run_setup("--clone", "--preflight",
+                                      AOE4_BOTTLE=self.a_bottle())
         self.assertEqual(rc, 0, err)
         self.assertIn("satoru: mode=", out)
         self.assertEqual(os.listdir(self.home), [],
@@ -203,6 +242,7 @@ class Preflight(unittest.TestCase):
         env.pop("SATORU_GAME_HOME", None)
         legacy = os.path.join(self.dir, "legacy")
         env["AOE4_PACK_HOME"] = legacy
+        env["HOME"] = self.user
         proc = subprocess.Popen(
             ["bash", os.path.join(self.pack, "setup.sh"), "--preflight"],
             cwd=self.pack, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
