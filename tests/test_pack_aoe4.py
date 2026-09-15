@@ -443,6 +443,295 @@ class CloneIsIdempotent(unittest.TestCase):
         self.assertIn("Prefix " + self.prefix + " already exists", out)
 
 
+def host_passes_preflight():
+    """The host half of preflight is real: Apple Silicon, macOS 26+, Rosetta."""
+    def say(*cmd):
+        try:
+            return subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode().strip()
+        except (OSError, subprocess.CalledProcessError):
+            return ""
+    if say("sysctl", "-n", "hw.optional.arm64") != "1":
+        return False
+    if say("sw_vers", "-productVersion").split(".")[0] not in ("26", "27"):
+        return False
+    return subprocess.call(["/usr/bin/arch", "-x86_64", "/usr/bin/true"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+
+
+@unittest.skipUnless(os.path.isfile(os.path.join(PACK_SRC, "setup.sh")) and host_passes_preflight(),
+                     "needs the aoe4 submodule and a host preflight accepts")
+class UpdateIsInstallRunAgain(unittest.TestCase):
+    """An update is setup.sh run again over a home that is already there.
+
+    Measured on the Air with v0.2: preflight 0, install 0, preflight 0. satoru
+    skips install only on 11, so every Update re-ran all of it. A home this very
+    pack finished answers 11; a newer pack, or a home missing a piece, answers 0.
+
+    The same rerun also went looking under ~/Games again. A prefix that already
+    has the game - Steam's own download, or the library linked in last time -
+    got the ~/Games library forced on it: its app manifests overwritten with
+    older ones, an install refused over an AOE4_STEAMAPPS nobody set, or a
+    different exe build in ~/Games refusing an update that never needed it.
+
+    Everything binary is a stand-in: the engine and wineserver are scripts that
+    leave a mark and fail, so a test that reaches Wine or Valve's download says
+    so instead of running it. The prefix already has Steam, which is the state
+    every rerun starts from and the one where setup.sh never calls either.
+    """
+
+    STEAMAPPS = os.path.join("drive_c", "Program Files (x86)", "Steam", "steamapps")
+    MANIFEST = "appmanifest_1466860.acf"
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.pack = os.path.join(self.dir, "pack")
+        self.home = os.path.join(self.dir, "home")
+        self.user = os.path.join(self.dir, "user")
+        self.bin = os.path.join(self.dir, "bin")
+        self.marks = os.path.join(self.dir, "marks")
+        for d in (self.user, self.bin, self.marks):
+            os.makedirs(d)
+
+        refuse = "#!/bin/sh\ntouch '%s/$(basename \"$0\")'\nexit 99\n" % self.marks
+        for rel, body, mode in (
+                ("Engine/bin/wine", refuse, 0o755),
+                ("Engine/bin/wineserver", refuse, 0o755),
+                ("Engine/lib/wine/x86_64-unix/ntdll.so", "", 0o644),
+                ("Helpers/x87sidecar", "#!/bin/sh\necho supported\n", 0o755),
+                ("deps/Frameworks/libgnutls.30.dylib", "", 0o644),
+                ("deps/Frameworks/libinotify.dylib", "", 0o644),
+                ("dxmt/x86_64-windows/d3d12.dll", "", 0o644)):
+            self.write(os.path.join(self.pack, rel), body, mode)
+        for name in ("dxmt.conf", "counters.py", "patch-profile.py", "aoe4.sh", "setup.sh"):
+            shutil.copy2(os.path.join(PACK_SRC, name), os.path.join(self.pack, name))
+        self.write(os.path.join(self.pack, "SHA256SUMS"), "pack one\n")
+
+        # pgrep: this machine's wineserver is not ours to stop. system_profiler:
+        # slow, and the pacing it feeds is not under test. curl: Valve's
+        # installer must never be fetched from here.
+        for name, body in (("pgrep", "#!/bin/sh\nexit 1\n"),
+                           ("system_profiler", "#!/bin/sh\nexit 0\n"),
+                           ("curl", refuse)):
+            self.write(os.path.join(self.bin, name), body, 0o755)
+
+        # A prefix Steam is installed in: what every run after the first finds.
+        self.prefix = os.path.join(self.home, "prefix")
+        self.prefix_steamapps = os.path.join(self.prefix, self.STEAMAPPS)
+        os.makedirs(self.prefix_steamapps)
+        self.write(os.path.join(self.prefix, "system.reg"), "WINE REGISTRY Version 2\n")
+        self.write(os.path.join(self.prefix_steamapps, os.pardir, "steam.exe"), "MZ\n")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    @staticmethod
+    def write(path, body, mode=0o644):
+        os.makedirs(os.path.dirname(os.path.normpath(path)), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(body)
+        os.chmod(path, mode)
+
+    def run_setup(self, *args, **env_extra):
+        env = dict(os.environ)
+        for name in ("AOE4_BOTTLE", "AOE4_MODE", "AOE4_STEAMAPPS", "AOE4_PACK_HOME"):
+            env.pop(name, None)
+        env["SATORU_GAME_HOME"] = self.home
+        env["HOME"] = self.user
+        env["PATH"] = self.bin + os.pathsep + env.get("PATH", "")
+        env.update(env_extra)
+        proc = subprocess.Popen(
+            ["bash", os.path.join(self.pack, "setup.sh")] + list(args),
+            cwd=self.pack, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = proc.communicate(timeout=300)
+        self.assertEqual(os.listdir(self.marks), [],
+                         "setup.sh ran the engine or the download:\n" + out.decode() + err.decode())
+        return proc.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
+
+    def install(self, **env_extra):
+        rc, out, err = self.run_setup(**env_extra)
+        self.assertEqual(rc, 0, out + err)
+        return out
+
+    def a_games_library(self, manifest="the library's manifest\n"):
+        """~/Games/<bottle>/steamapps with a game exe of a build the patch is not wired to."""
+        steamapps = os.path.join(self.user, "Games", "AoE4", "steamapps")
+        self.write(os.path.join(steamapps, "common", "Age of Empires IV", "RelicCardinal.exe"),
+                   "MZ, but not the build the Wine patch is wired to")
+        self.write(os.path.join(steamapps, self.MANIFEST), manifest)
+        return steamapps
+
+    def steam_downloaded_the_game(self, manifest="Steam's own, newer\n"):
+        self.write(os.path.join(self.prefix_steamapps, "common", "Age of Empires IV",
+                                "RelicCardinal.exe"), "MZ, whatever Steam delivered")
+        self.write(os.path.join(self.prefix_steamapps, self.MANIFEST), manifest)
+
+    def read(self, path):
+        with open(path) as fh:
+            return fh.read()
+
+    # ---- ow2-4wx: nothing to do is 11 ----
+
+    def test_a_finished_install_has_nothing_to_do(self):
+        rc, _, err = self.run_setup("--preflight")
+        self.assertEqual(rc, 0, err)
+        self.install()
+        rc, out, err = self.run_setup("--preflight")
+        self.assertEqual(rc, 11, out + err)
+        self.assertIn("satoru: home=" + self.home, out, "11 must still come with the facts")
+
+    def test_preflight_on_a_finished_home_still_writes_nothing(self):
+        self.install()
+        before = fingerprint(self.home)
+        rc, out, err = self.run_setup("--preflight")
+        self.assertEqual(rc, 11, out + err)
+        self.assertEqual(fingerprint(self.home), before,
+                         "preflight wrote into the home while deciding there was nothing to do")
+
+    def test_a_newer_pack_is_not_nothing_to_do(self):
+        self.install()
+        self.write(os.path.join(self.pack, "SHA256SUMS"), "pack two\n")
+        with open(os.path.join(self.pack, "aoe4.sh"), "a") as fh:
+            fh.write("# pack two\n")
+        rc, out, err = self.run_setup("--preflight")
+        self.assertEqual(rc, 0, out + err)
+        self.install()
+        self.assertEqual(self.read(os.path.join(self.home, "aoe4.sh")).splitlines()[-1],
+                         "# pack two", "the newer launcher did not land in the home")
+        rc, out, err = self.run_setup("--preflight")
+        self.assertEqual(rc, 11, out + err)
+
+    def test_a_home_missing_a_piece_the_launcher_needs_is_not_complete(self):
+        self.install()
+        for rel in ("Engine/bin/wine", "Helpers/x87sidecar", "dxmt/x86_64-windows/d3d12.dll",
+                    "deps/Frameworks/libgnutls.30.dylib", "aoe4.sh",
+                    os.path.join("prefix", self.STEAMAPPS, os.pardir, "steam.exe"),
+                    os.path.join("prefix", "system.reg")):
+            full = os.path.normpath(os.path.join(self.home, rel))
+            kept = full + ".away"
+            os.rename(full, kept)
+            try:
+                rc, out, err = self.run_setup("--preflight")
+                self.assertEqual(rc, 0, "home without %s answered %d:\n%s" % (rel, rc, out + err))
+            finally:
+                os.rename(kept, full)
+
+    def test_a_home_missing_any_file_the_pack_ships_in_deps_or_dxmt_is_not_complete(self):
+        """INSTALL.md's cure for Steam's missing text is "re-run setup.sh" - it has to still run."""
+        for rel in ("deps/Frameworks/libfreetype.6.dylib", "dxmt/x86_64-windows/dxgi.dll"):
+            self.write(os.path.join(self.pack, rel), "")
+        self.install()
+        for rel in ("deps/Frameworks/libfreetype.6.dylib", "dxmt/x86_64-windows/dxgi.dll"):
+            full = os.path.join(self.home, rel)
+            os.rename(full, full + ".away")
+            try:
+                rc, out, err = self.run_setup("--preflight")
+                self.assertEqual(rc, 0, "home without %s answered %d:\n%s" % (rel, rc, out + err))
+            finally:
+                os.rename(full + ".away", full)
+
+    def test_a_linked_library_that_moved_away_is_a_repair_not_nothing_to_do(self):
+        library = os.path.join(self.dir, "library")
+        self.write(os.path.join(library, "common", "README"), "no exe: the build check has nothing to refuse\n")
+        self.install(AOE4_STEAMAPPS=library)
+        rc, out, err = self.run_setup("--preflight", AOE4_STEAMAPPS=library)
+        self.assertEqual(rc, 11, out + err)
+        shutil.rmtree(library)
+        rc, out, err = self.run_setup("--preflight")
+        self.assertEqual(rc, 0, "a dangling game link answered %d:\n%s" % (rc, out + err))
+
+    def test_a_different_library_named_is_a_relink_not_nothing_to_do(self):
+        first, second = os.path.join(self.dir, "first"), os.path.join(self.dir, "second")
+        for library in (first, second):
+            self.write(os.path.join(library, "common", "README"), "no exe\n")
+        self.install(AOE4_STEAMAPPS=first)
+        rc, out, err = self.run_setup("--preflight", AOE4_STEAMAPPS=second)
+        self.assertEqual(rc, 0, out + err)
+
+    def test_a_failed_rerun_does_not_leave_the_old_verdict_behind(self):
+        """A run that dies half-way has not finished; the previous .pack-id must not say it has."""
+        self.install()
+        # A piece gone, so the rerun gets past preflight; then it dies at the
+        # profile step, after the piece is back. SHA256SUMS is unchanged, so the
+        # old .pack-id still names this very pack.
+        shutil.rmtree(os.path.join(self.home, "dxmt"))
+        self.write(os.path.join(self.pack, "patch-profile.py"), "import sys\nsys.exit(3)\n")
+        rc, out, err = self.run_setup()
+        self.assertNotIn(rc, (0, 11), out + err)
+        self.assertTrue(os.path.isfile(os.path.join(self.home, "dxmt", "x86_64-windows", "d3d12.dll")),
+                        "the rerun died before it put the piece back, so this proves nothing")
+        rc, out, err = self.run_setup("--preflight")
+        self.assertEqual(rc, 0, out + err)
+
+    # ---- ow2-gv6: a rerun does not reach for ~/Games ----
+
+    def test_a_prefix_with_the_game_is_not_given_the_games_library(self):
+        self.steam_downloaded_the_game()
+        self.a_games_library()
+        rc, out, err = self.run_setup("--preflight")
+        self.assertEqual(rc, 0, "a different build under ~/Games refused an update:\n" + out + err)
+        self.assertNotIn("reusing the Steam library", out)
+
+    def test_a_rerun_over_steams_own_download_installs(self):
+        self.steam_downloaded_the_game()
+        self.a_games_library()
+        rc, out, err = self.run_setup()
+        self.assertEqual(rc, 0, out + err)
+        self.assertNotIn("AOE4_STEAMAPPS", err)
+        common = os.path.join(self.prefix_steamapps, "common")
+        self.assertFalse(os.path.islink(common), "Steam's own library was replaced by a link")
+        self.assertTrue(os.path.isfile(os.path.join(common, "Age of Empires IV", "RelicCardinal.exe")))
+
+    def test_a_download_steam_has_under_way_is_not_given_the_games_library(self):
+        """Steam's own common/, the game folder started, no exe yet: still Steam's."""
+        os.makedirs(os.path.join(self.prefix_steamapps, "common", "Age of Empires IV"))
+        self.a_games_library()
+        rc, out, err = self.run_setup()
+        self.assertEqual(rc, 0, out + err)
+        self.assertNotIn("AOE4_STEAMAPPS", err)
+        self.assertFalse(os.path.islink(os.path.join(self.prefix_steamapps, "common")))
+
+    def test_a_rerun_does_not_copy_manifests_over_steams(self):
+        self.steam_downloaded_the_game(manifest="Steam's own, newer\n")
+        self.a_games_library(manifest="the library's, from April\n")
+        self.install()
+        self.assertEqual(self.read(os.path.join(self.prefix_steamapps, self.MANIFEST)),
+                         "Steam's own, newer\n")
+
+    def test_a_rerun_over_the_library_linked_last_time_leaves_it_as_it_is(self):
+        """The link from the first install is the game; the library's exe is not re-judged."""
+        steamapps = self.a_games_library(manifest="the library's, from April\n")
+        os.symlink(os.path.join(steamapps, "common"), os.path.join(self.prefix_steamapps, "common"))
+        self.write(os.path.join(self.prefix_steamapps, self.MANIFEST), "Steam updated it since\n")
+        rc, out, err = self.run_setup("--preflight")
+        self.assertEqual(rc, 0, out + err)
+        self.install()
+        self.assertEqual(self.read(os.path.join(self.prefix_steamapps, self.MANIFEST)),
+                         "Steam updated it since\n")
+
+    def test_an_explicit_library_never_overwrites_a_newer_manifest(self):
+        """AOE4_STEAMAPPS still links what it names; a manifest Steam has since rewritten stays."""
+        library = os.path.join(self.dir, "library")
+        self.write(os.path.join(library, "common", "README"), "no exe: the build check has nothing to refuse\n")
+        self.write(os.path.join(library, self.MANIFEST), "the library's, from April\n")
+        self.write(os.path.join(library, "appmanifest_228980.acf"), "redistributables\n")
+        os.utime(os.path.join(library, self.MANIFEST), (1_700_000_000, 1_700_000_000))
+        self.write(os.path.join(self.prefix_steamapps, self.MANIFEST), "Steam updated it since\n")
+        self.install(AOE4_STEAMAPPS=library)
+        self.assertEqual(os.readlink(os.path.join(self.prefix_steamapps, "common")),
+                         os.path.join(library, "common"))
+        self.assertEqual(self.read(os.path.join(self.prefix_steamapps, self.MANIFEST)),
+                         "Steam updated it since\n")
+        self.assertEqual(self.read(os.path.join(self.prefix_steamapps, "appmanifest_228980.acf")),
+                         "redistributables\n", "a manifest the prefix lacked was not copied")
+
+    def test_a_prefix_without_the_game_still_gets_the_games_library(self):
+        steamapps = self.a_games_library()
+        rc, out, err = self.run_setup("--preflight")
+        self.assertIn("reusing the Steam library at " + steamapps, out)
+        self.assertEqual(rc, 10, err)
+        self.assertIn("RelicCardinal.exe sha256", err)
+
+
 
 @unittest.skipUnless(os.path.isfile(os.path.join(PACK_SRC, "tools", "make-pack.sh")),
                      "needs the aoe4 submodule")
