@@ -340,7 +340,8 @@ class CloneIsIdempotent(unittest.TestCase):
     why this stubs pgrep rather than skipping on someone else's wineserver.
     """
 
-    PACK_FILES = ("dxmt.conf", "counters.py", "patch-profile.py", "aoe4.sh", "setup.sh")
+    PACK_FILES = ("dxmt.conf", "counters.py", "patch-profile.py", "aoe4.sh", "setup.sh",
+                  "migrate-prefix-user.sh")
 
     def setUp(self):
         self.dir = tempfile.mkdtemp()
@@ -505,7 +506,8 @@ class UpdateIsInstallRunAgain(unittest.TestCase):
                 ("deps/Frameworks/libinotify.dylib", "", 0o644),
                 ("dxmt/x86_64-windows/d3d12.dll", "", 0o644)):
             self.write(os.path.join(self.pack, rel), body, mode)
-        for name in ("dxmt.conf", "counters.py", "patch-profile.py", "aoe4.sh", "setup.sh"):
+        for name in ("dxmt.conf", "counters.py", "patch-profile.py", "aoe4.sh", "setup.sh",
+                     "migrate-prefix-user.sh"):
             shutil.copy2(os.path.join(PACK_SRC, name), os.path.join(self.pack, name))
         self.write(os.path.join(self.pack, "SHA256SUMS"), "pack one\n")
         # The patch is wired to one exe build. The stand-in exe Steam "downloaded"
