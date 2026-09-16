@@ -10,6 +10,7 @@ and must never offer an action that does not exist:
   fix = {"kind": "manual"}  only you can, here is how
   fix = None                nobody can
 """
+import os
 import unittest
 
 from support import satoru
@@ -121,6 +122,23 @@ class Versions(unittest.TestCase):
 class RealMachine(unittest.TestCase):
     """The default probe has to answer about the Mac it is running on."""
 
+    def test_arch_describes_the_machine_and_not_the_process(self):
+        """A translated interpreter must not make an M-series Mac look like Intel.
+
+        tests/run.sh runs the suite on every interpreter this Mac has, and some
+        of them are x86_64 binaries under Rosetta - which is exactly the case
+        this guards. On a native interpreter there is nothing to prove.
+        """
+        import platform
+        import subprocess
+        translated = subprocess.check_output(
+            ["sysctl", "-n", "sysctl.proc_translated"]).strip() == b"1"
+        if not translated:
+            self.skipTest("this interpreter is native, so the two answers agree anyway")
+        self.assertNotEqual(satoru.SystemProbe().arch(), platform.machine(),
+                            "arch() is reporting the process, not the machine")
+        self.assertEqual(satoru.SystemProbe().arch(), "arm64")
+
     def test_system_probe_answers(self):
         p = satoru.SystemProbe()
         self.assertTrue(p.arch())
@@ -129,6 +147,27 @@ class RealMachine(unittest.TestCase):
         self.assertGreater(p.free_gb("/"), 0)
         self.assertTrue(p.which("sh"))
         self.assertIsNone(p.which("definitely-not-a-real-binary-xyzzy"))
+
+    def test_free_space_can_be_read_before_the_directory_exists(self):
+        """The first install asks about a library nothing has created yet.
+
+        statvfs on a path that is not there raises, and the raise came out of
+        install_game as a traceback across the TUI - on the one flow that has to
+        work on a clean machine. The question is about a volume, and the volume
+        is there whether or not the directory is.
+        """
+        import tempfile
+        missing = os.path.join(tempfile.mkdtemp(), "Library", "Application Support",
+                               "satoru", "library")
+        self.assertGreater(satoru.SystemProbe().free_gb(missing), 0)
+
+    def test_a_disk_requirement_survives_a_directory_that_is_not_there(self):
+        import tempfile
+        missing = os.path.join(tempfile.mkdtemp(), "not", "made", "yet")
+        result = by_id(satoru.check_requirements({"disk_gb": 4},
+                                                 probe=satoru.SystemProbe(),
+                                                 root=missing), "disk")
+        self.assertIsNotNone(result)
 
 
 if __name__ == "__main__":

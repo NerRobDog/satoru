@@ -51,6 +51,10 @@ class SameAsTomllib(unittest.TestCase):
         '[requires]\narch = "arm64"\nrosetta = true\ndisk_gb = 4\ntools = ["dotnet"]\n',
         '[game]\nnotes = """\na\nb\n"""\nstatus = "rc"\n',
         '[install]\nhome_authoritative = false\nforeign_note = "touches your bottle"\n',
+        # A home path is a filename, and a filename can hold quotes and backslashes.
+        # Unescaping these with a chain of .replace() gets them wrong in either order.
+        r'[g]' + '\n' + r'home = "/x/A \"quoted\" \\ path"' + '\n',
+        r'[g]' + '\n' + r'trailing = "ends with a backslash \\"' + '\n',
     ]
 
     @unittest.skipUnless(has_tomllib(), "tomllib needs Python 3.11+")

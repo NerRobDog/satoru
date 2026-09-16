@@ -84,7 +84,11 @@ TXT
 
 TARBALL="dist/satoru-$VERSION.tar.gz"
 rm -f "$TARBALL"
-tar -czf "$TARBALL" -C dist "satoru-$VERSION"
+# COPYFILE_DISABLE: without it macOS tar writes an AppleDouble `._name` beside
+# every entry whose file has extended attributes, and those ship inside the
+# tarball. In a pack archive they defeat the single-root check on unpack; here
+# they are litter in the user's directory. Neither is worth carrying.
+COPYFILE_DISABLE=1 tar -czf "$TARBALL" -C dist "satoru-$VERSION"
 
 echo
 echo "built $TARBALL"

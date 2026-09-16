@@ -11,11 +11,16 @@ do nothing; actions whose script is not on disk say "missing".
     python3 launcher/satoru.py --check    # validate every game.toml, exit 1 on error
     python3 launcher/satoru.py --version  # what this build is, and which packs it knows
 """
+import contextlib
+import datetime
+import hashlib
 import os
 import platform
 import re
 import shlex
 import shutil
+import tarfile
+import urllib.request
 import subprocess
 import sys
 
@@ -73,124 +78,386 @@ ACTIONS = (
 
 
 # ----------------------------------------------------------------------------
-# TOML: tomllib on 3.11+, otherwise a minimal reader for the game.toml subset
-# ([section], key = "string" | 123 | true | false | """multi-line""", # comments)
+# The manifest language.
+#
+# One reader, on every interpreter, on purpose. tomllib arrived in 3.11 and the
+# Python that ships with macOS is 3.9, so choosing a reader per interpreter meant
+# a manifest could mean one thing to the person who wrote it and another to the
+# person who runs it - an accent spelled é in a path, an escape inside a
+# multi-line note - with nothing raised on either side. An audit found 58 such
+# differences. Reading the same way everywhere closes that class by construction;
+# tomllib stays, as the oracle the tests check this reader against.
+#
+# Supported, and this list is the whole of it: [section] headers one level deep;
+# bare keys of letters, digits, underscore and dash; basic strings with the
+# v1.0.0 escapes; multi-line basic strings with escapes and line continuation;
+# literal strings, single- and multi-line; true and false; decimal integers with
+# optional underscores; arrays of one of those types, over as many lines as you
+# like; # comments.
+#
+# Refused by name: floats, dates and times, non-decimal integers, inline tables,
+# dotted or quoted keys, arrays of tables, nested arrays, arrays of mixed types.
+# These are legal TOML and a subset that guessed at them would be a trap; a
+# subset that says "not supported here" is a contract.
 
-def _parse_scalar(val, lineno):
-    """A bare value: string, bool or integer. Everything else is an error, loudly."""
-    val = val.strip()
-    if val.startswith('"') and val.endswith('"') and len(val) >= 2:
-        return val[1:-1].replace('\\"', '"').replace("\\n", "\n")
-    val = val.split("#", 1)[0].strip()
-    if val == "true":
-        return True
-    if val == "false":
-        return False
-    try:
-        return int(val)
-    except ValueError:
-        raise ValueError("line %d: unsupported value %r" % (lineno, val))
+_BARE_KEY = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+_HEX = frozenset("0123456789abcdefABCDEF")
+_ESCAPES = {'"': '"', "\\": "\\", "b": "\b", "f": "\f", "n": "\n", "r": "\r",
+            "t": "\t"}
 
 
-def _parse_array(val, lineno):
-    """A single-line array: ["a", "b"]. Enough for [requires] tools, and no more.
+class _Toml(object):
+    """A cursor over the whole document.
 
-    Scanning for the closing bracket has to ignore one inside a string, or a path
-    with a bracket in it would end the array early.
+    Line by line is what the previous reader did, and it is why a value could
+    not span lines, why a comment after a closing delimiter swallowed the rest
+    of the file, and why junk after a value went unnoticed. A cursor makes each
+    of those the same question: what comes next.
     """
-    depth, end, in_str = 0, -1, False
-    for pos, ch in enumerate(val):
-        if ch == '"' and (pos == 0 or val[pos - 1] != "\\"):
-            in_str = not in_str
-        elif not in_str and ch == "[":
-            depth += 1
-        elif not in_str and ch == "]":
-            depth -= 1
-            if depth == 0:
-                end = pos
+
+    def __init__(self, text):
+        if text.startswith("﻿"):
+            # A browser, a copy-paste or a Windows editor adds this. It is not
+            # part of the first key's name.
+            text = text[1:]
+        self.s = text.replace("\r\n", "\n")
+        self.i = 0
+        self.n = len(self.s)
+
+    # -- where we are ---------------------------------------------------------
+
+    def line(self):
+        return self.s.count("\n", 0, self.i) + 1
+
+    def fail(self, message):
+        raise ValueError("line %d: %s" % (self.line(), message))
+
+    def fail_at(self, line, message):
+        """For a value that spans lines, the opening is the useful place to point."""
+        raise ValueError("line %d: %s" % (line, message))
+
+    def peek(self, ahead=0):
+        j = self.i + ahead
+        return self.s[j] if j < self.n else ""
+
+    def starts(self, text):
+        return self.s.startswith(text, self.i)
+
+    # -- whitespace -----------------------------------------------------------
+
+    def skip_inline(self):
+        while self.i < self.n and self.s[self.i] in " \t":
+            self.i += 1
+
+    def skip_comment(self):
+        if self.peek() == "#":
+            while self.i < self.n and self.s[self.i] != "\n":
+                self.i += 1
+
+    def skip_blanks(self):
+        """Between statements: spaces, comments and line endings."""
+        while self.i < self.n:
+            ch = self.s[self.i]
+            if ch in " \t\n":
+                self.i += 1
+            elif ch == "#":
+                self.skip_comment()
+            elif ch == "\r":
+                self.fail("a bare carriage return is not a line ending")
+            else:
+                return
+
+    def end_of_statement(self):
+        """A statement owns the rest of its line, and nothing else may be on it."""
+        self.skip_inline()
+        self.skip_comment()
+        if self.i >= self.n:
+            return
+        if self.s[self.i] == "\n":
+            self.i += 1
+            return
+        rest = self.s[self.i:].split("\n", 1)[0].strip()
+        self.fail("junk after the value: %r" % rest)
+
+    # -- the document ---------------------------------------------------------
+
+    def parse(self):
+        data = {}
+        table, table_name = data, None
+        seen = {None: set()}
+        while True:
+            self.skip_blanks()
+            if self.i >= self.n:
+                return data
+            if self.s[self.i] == "[":
+                table_name = self.table_header(data)
+                table = data[table_name]
+                seen[table_name] = set()
+                continue
+            key = self.bare_key()
+            self.skip_inline()
+            if self.peek() != "=":
+                self.fail("expected = after %r" % key)
+            self.i += 1
+            self.skip_inline()
+            value = self.value()
+            self.end_of_statement()
+            if key in seen[table_name]:
+                self.fail("%r is given twice" % key)
+            seen[table_name].add(key)
+            table[key] = value
+
+    def table_header(self, data):
+        line = self.line()
+        self.i += 1
+        if self.peek() == "[":
+            self.fail("an array of tables is not supported here")
+        self.skip_inline()
+        name = self.bare_key("table name")
+        self.skip_inline()
+        if self.peek() != "]":
+            self.fail_at(line, "expected ] to close [%s" % name)
+        self.i += 1
+        self.end_of_statement()
+        if name in data:
+            # Covers a repeated [section] and a bare key of the same name; TOML
+            # forbids declaring a table twice either way.
+            self.fail_at(line, "%r is declared twice" % name)
+        data[name] = {}
+        return name
+
+    def bare_key(self, what="key"):
+        if self.peek() in ('"', "'"):
+            self.fail("a quoted %s is not supported here" % what)
+        start = self.i
+        while self.i < self.n and self.s[self.i] in _BARE_KEY:
+            self.i += 1
+        if self.i == start:
+            self.fail("expected a %s" % what)
+        key = self.s[start:self.i]
+        if self.peek() == ".":
+            self.fail("a dotted %s is not supported here" % what)
+        return key
+
+    # -- values ---------------------------------------------------------------
+
+    def value(self):
+        ch = self.peek()
+        if ch == "" or ch == "\n":
+            self.fail("expected a value")
+        if self.starts('"""'):
+            return self.multiline_basic()
+        if ch == '"':
+            return self.basic_string()
+        if self.starts("'''"):
+            return self.multiline_literal()
+        if ch == "'":
+            return self.literal_string()
+        if ch == "[":
+            return self.array()
+        if ch == "{":
+            self.fail("an inline table is not supported here")
+        return self.atom()
+
+    def atom(self):
+        start = self.i
+        while self.i < self.n and self.s[self.i] not in " \t\n,]#":
+            self.i += 1
+        raw = self.s[start:self.i]
+        if not raw:
+            self.fail("expected a value")
+        if raw == "true":
+            return True
+        if raw == "false":
+            return False
+        return self.integer(raw)
+
+    def integer(self, raw):
+        body = raw[1:] if raw[:1] in "+-" else raw
+        low = body.lower()
+        if low[:2] in ("0x", "0o", "0b"):
+            self.fail("hexadecimal, octal and binary integers are not supported "
+                      "here; write it in decimal")
+        if "." in body or "e" in low or low in ("inf", "nan"):
+            self.fail("floats are not supported here")
+        if "-" in body[1:] or ":" in body:
+            self.fail("dates and times are not supported here")
+        if body.startswith("_") or body.endswith("_") or "__" in body:
+            self.fail("unsupported value %r" % raw)
+        digits = body.replace("_", "")
+        if not digits or not digits.isdigit() or not digits.isascii():
+            self.fail("unsupported value %r" % raw)
+        if len(digits) > 1 and digits[0] == "0":
+            self.fail("unsupported value %r: an integer may not have a leading zero"
+                      % raw)
+        return int(raw.replace("_", ""))
+
+    def forbid_control(self, ch, allow_newline=False):
+        o = ord(ch)
+        if ch == "\t" or (allow_newline and ch == "\n"):
+            return
+        if o < 0x20 or o == 0x7F:
+            self.fail("a control character (U+%04X) has to be escaped in a string"
+                      % o)
+
+    def escape(self, multiline):
+        ch = self.peek()
+        if ch == "":
+            self.fail("a string may not end in a lone backslash")
+        if ch in _ESCAPES:
+            self.i += 1
+            return _ESCAPES[ch]
+        if ch in ("u", "U"):
+            width = 4 if ch == "u" else 8
+            self.i += 1
+            digits = self.s[self.i:self.i + width]
+            if len(digits) != width or any(c not in _HEX for c in digits):
+                self.fail("\\%s needs %d hex digits" % (ch, width))
+            self.i += width
+            point = int(digits, 16)
+            if point > 0x10FFFF or 0xD800 <= point <= 0xDFFF:
+                self.fail("\\%s%s is not a character" % (ch, digits))
+            return chr(point)
+        if multiline:
+            # A backslash at the end of a line joins it to the next, swallowing
+            # the line ending and the indent that follows.
+            j = self.i
+            while j < self.n and self.s[j] in " \t":
+                j += 1
+            if j < self.n and self.s[j] == "\n":
+                j += 1
+                while j < self.n and self.s[j] in " \t\n":
+                    j += 1
+                self.i = j
+                return ""
+        self.fail("unknown escape \\%s" % ch)
+
+    def basic_string(self):
+        line = self.line()
+        self.i += 1
+        out = []
+        while True:
+            if self.i >= self.n or self.s[self.i] == "\n":
+                self.fail_at(line, "unterminated string")
+            ch = self.s[self.i]
+            if ch == '"':
+                self.i += 1
+                return "".join(out)
+            if ch == "\\":
+                self.i += 1
+                out.append(self.escape(False))
+                continue
+            self.forbid_control(ch)
+            out.append(ch)
+            self.i += 1
+
+    def multiline_basic(self):
+        line = self.line()
+        self.i += 3
+        if self.peek() == "\n":
+            # Exactly one, and only where it follows the opening delimiter.
+            self.i += 1
+        out = []
+        while True:
+            if self.i >= self.n:
+                self.fail_at(line, "unterminated multi-line string")
+            if self.starts('"""'):
+                self.i += 3
+                if self.peek() == '"':
+                    self.fail_at(line, "a multi-line string ending in a quote is "
+                                       "not supported here; escape it as \\\"")
+                return "".join(out)
+            ch = self.s[self.i]
+            if ch == "\\":
+                self.i += 1
+                out.append(self.escape(True))
+                continue
+            self.forbid_control(ch, allow_newline=True)
+            out.append(ch)
+            self.i += 1
+
+    def literal_string(self):
+        line = self.line()
+        self.i += 1
+        out = []
+        while True:
+            if self.i >= self.n or self.s[self.i] == "\n":
+                self.fail_at(line, "unterminated string")
+            ch = self.s[self.i]
+            if ch == "'":
+                self.i += 1
+                return "".join(out)
+            self.forbid_control(ch)
+            out.append(ch)
+            self.i += 1
+
+    def multiline_literal(self):
+        line = self.line()
+        self.i += 3
+        if self.peek() == "\n":
+            self.i += 1
+        out = []
+        while True:
+            if self.i >= self.n:
+                self.fail_at(line, "unterminated multi-line string")
+            if self.starts("'''"):
+                self.i += 3
+                if self.peek() == "'":
+                    self.fail_at(line, "a multi-line string ending in a quote is "
+                                       "not supported here")
+                return "".join(out)
+            ch = self.s[self.i]
+            self.forbid_control(ch, allow_newline=True)
+            out.append(ch)
+            self.i += 1
+
+    def skip_array_space(self):
+        while self.i < self.n:
+            ch = self.s[self.i]
+            if ch in " \t\n":
+                self.i += 1
+            elif ch == "#":
+                self.skip_comment()
+            else:
+                return
+
+    def array(self):
+        line = self.line()
+        self.i += 1
+        items = []
+        after_comma = True
+        while True:
+            self.skip_array_space()
+            if self.i >= self.n:
+                self.fail_at(line, "unterminated array")
+            if self.peek() == "]":
+                self.i += 1
                 break
-    if end == -1:
-        raise ValueError(
-            "line %d: unterminated array (multi-line arrays are not supported, "
-            "keep it on one line)" % lineno)
-    body = val[1:end].strip()
-    if not body:
-        return []
-    items, cur_item, in_str = [], "", False
-    for pos, ch in enumerate(body):
-        if ch == '"' and (pos == 0 or body[pos - 1] != "\\"):
-            in_str = not in_str
-            cur_item += ch
-        elif ch == "," and not in_str:
-            items.append(cur_item)
-            cur_item = ""
-        else:
-            cur_item += ch
-    items.append(cur_item)
-    return [_parse_scalar(x, lineno) for x in items if x.strip()]
+            if not after_comma:
+                self.fail("expected , between array items")
+            if self.peek() == "[":
+                self.fail("a nested array is not supported here")
+            items.append(self.value())
+            self.skip_array_space()
+            after_comma = self.peek() == ","
+            if after_comma:
+                self.i += 1
+        kinds = set(("bool" if v is True or v is False else type(v).__name__)
+                    for v in items)
+        if len(kinds) > 1:
+            self.fail_at(line, "an array of mixed types is not supported here")
+        return items
 
 
 def _parse_minimal_toml(text):
-    data = {}
-    cur = data
-    lines = text.splitlines()
-    i = 0
-    while i < len(lines):
-        raw = lines[i]
-        line = raw.strip()
-        i += 1
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("[") and line.endswith("]"):
-            name = line[1:-1].strip()
-            cur = data.setdefault(name, {})
-            continue
-        if "=" not in line:
-            raise ValueError("line %d: expected key = value: %r" % (i, raw))
-        key, _, val = line.partition("=")
-        key = key.strip()
-        val = val.strip()
-        if val.startswith('"""'):
-            body = val[3:]
-            if body.endswith('"""') and len(body) >= 3:
-                cur[key] = body[:-3]
-                continue
-            parts = [body] if body else []
-            while i < len(lines):
-                l2 = lines[i]
-                i += 1
-                if l2.rstrip().endswith('"""'):
-                    parts.append(l2.rstrip()[:-3])
-                    break
-                parts.append(l2)
-            else:
-                raise ValueError("unterminated multi-line string for %r" % key)
-            cur[key] = "\n".join(parts).lstrip("\n")
-            continue
-        if val.startswith('"'):
-            end = val.find('"', 1)
-            while end != -1 and val[end - 1] == "\\":
-                end = val.find('"', end + 1)
-            if end == -1:
-                raise ValueError("line %d: unterminated string" % i)
-            cur[key] = val[1:end].replace('\\"', '"').replace("\\n", "\n")
-            continue
-        if val.startswith("["):
-            cur[key] = _parse_array(val, i)
-            continue
-        cur[key] = _parse_scalar(val, i)
-    return data
+    return _Toml(text).parse()
 
 
 def load_toml(path):
+    """The one reader, whatever the interpreter. See the note above."""
     with open(path, "rb") as f:
         raw = f.read()
-    try:
-        import tomllib  # 3.11+
-    except ImportError:
-        tomllib = None
-    if tomllib is not None:
-        return tomllib.loads(raw.decode("utf-8"))
     return _parse_minimal_toml(raw.decode("utf-8"))
 
 
@@ -254,6 +521,15 @@ def parse_manifest(data):
             "the pack needs contract %d, this satoru speaks %d - update satoru"
             % (contract, CONTRACT))
     m["contract"] = contract
+
+    if contract == 0 and any(k in data for k in ("source", "requires", "install",
+                                                 "commands", "paths")):
+        # One forgotten line otherwise turns a correct v1 manifest into a handful
+        # of "unknown section" errors that accuse the very sections the author
+        # copied out of the contract.
+        errors.append(
+            "this looks like a contract 1 manifest but has no `contract = 1` "
+            "line, so it is being read as the older shape")
 
     if contract == 0:
         game = data.get("game", {})
@@ -328,6 +604,18 @@ def parse_manifest(data):
 # ----------------------------------------------------------------------------
 # [requires]: what the machine has to be before a pack is worth downloading
 
+
+def _nearest_existing(path):
+    """The closest ancestor of `path` that is actually there, `/` at worst."""
+    path = os.path.abspath(path)
+    while not os.path.exists(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    return path
+
+
 class SystemProbe(object):
     """Everything the checks want to know about this Mac, in one injectable place.
 
@@ -336,7 +624,23 @@ class SystemProbe(object):
     """
 
     def arch(self):
-        return platform.machine()
+        """The machine's architecture, not this process's.
+
+        platform.machine() answers about the running process, and a process can
+        be translated: python3.11 from an Intel Homebrew prefix reports x86_64
+        on an M1 Pro, and every child it spawns inherits that. Asking it would
+        tell a perfectly good Apple Silicon Mac that it needs an Apple Silicon
+        Mac. hw.optional.arm64 is a property of the hardware and does not lie.
+        """
+        try:
+            with open(os.devnull, "wb") as null:
+                out = subprocess.check_output(
+                    ["sysctl", "-n", "hw.optional.arm64"], stderr=null)
+            if out.strip() == b"1":
+                return "arm64"
+            return "x86_64"
+        except (OSError, subprocess.CalledProcessError):
+            return platform.machine()
 
     def macos_version(self):
         return platform.mac_ver()[0]
@@ -351,7 +655,14 @@ class SystemProbe(object):
             return False
 
     def free_gb(self, path=None):
-        st = os.statvfs(path or os.path.expanduser("~"))
+        """Free space on the volume that would hold `path`.
+
+        The first install asks about directories nothing has created yet, and
+        statvfs raises on a path that is not there. The question is about a
+        volume, and the volume exists whether or not the directory does, so walk
+        up until something answers.
+        """
+        st = os.statvfs(_nearest_existing(path or os.path.expanduser("~")))
         return st.f_bavail * st.f_frsize / float(1024 ** 3)
 
     def which(self, tool):
@@ -456,6 +767,662 @@ def all_met(results):
 
 
 # ----------------------------------------------------------------------------
+# installed.toml: what is installed, where, and of what version
+
+INSTALLED_KEYS = ("name", "version", "source_sha256", "installed_at", "home", "bundle")
+
+
+def _toml_string(value):
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def write_installed(path, entries):
+    """Rewrite the file from scratch, atomically.
+
+    Atomically because the alternative is a half-written state file, and a
+    launcher that cannot read its own state is worse than one with none.
+    """
+    lines = ["# satoru: what is installed. Written by satoru, not by packs.", ""]
+    for game_id in sorted(entries):
+        lines.append("[%s]" % game_id)
+        entry = entries[game_id]
+        for key in INSTALLED_KEYS:
+            if key in entry and entry[key] not in (None, ""):
+                lines.append("%s = %s" % (key, _toml_string(entry[key])))
+        lines.append("")
+    directory = os.path.dirname(path)
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines))
+    os.replace(tmp, path)
+
+
+def read_installed(path):
+    """Never raises. A missing or broken file means "nothing is installed"."""
+    try:
+        data = load_toml(path)
+    except (IOError, OSError):
+        return {}
+    except ValueError:
+        # Including tomllib's decode error, which is a ValueError. A state file
+        # someone hand-edited into nonsense should not take the launcher down.
+        return {}
+    return dict((k, v) for k, v in data.items() if isinstance(v, dict))
+
+
+def record_install(paths, manifest, source_sha256):
+    name = manifest["game"]["name"]
+    game_id = manifest["game"]["id"]
+    source = manifest.get("source") or {}
+    entries = read_installed(paths.installed_file)
+    entries[game_id] = {
+        "name": name,
+        "version": source.get("version") or "",
+        "source_sha256": source_sha256 or "",
+        "installed_at": datetime.datetime.now().replace(microsecond=0).isoformat(),
+        "home": paths.home(name),
+        "bundle": paths.bundle(name),
+    }
+    write_installed(paths.installed_file, entries)
+    return entries[game_id]
+
+
+def forget_install(paths, game_id):
+    entries = read_installed(paths.installed_file)
+    if entries.pop(game_id, None) is None:
+        return False
+    write_installed(paths.installed_file, entries)
+    return True
+
+
+def installed_entry(paths, game_id):
+    """The entry, or None if the home it names is gone.
+
+    installed.toml is a claim, not proof. Dragging a bundle to the Trash is a
+    normal thing for a person to do, and afterwards the launcher has to say the
+    game is not installed rather than offer to launch what is not there.
+    """
+    entry = read_installed(paths.installed_file).get(game_id)
+    if not entry:
+        return None
+    home = entry.get("home")
+    if not home or not os.path.isdir(home):
+        return None
+    return entry
+
+
+def installed_games(paths):
+    entries = read_installed(paths.installed_file)
+    return dict((gid, e) for gid, e in entries.items()
+                if e.get("home") and os.path.isdir(e["home"]))
+
+
+# ----------------------------------------------------------------------------
+# getting a pack onto the disk, and being sure it is the pack
+
+
+class PackError(Exception):
+    """The pack is not what it claims to be. Never a reason to keep going."""
+
+
+def verify_sha256(path, expected):
+    if not expected:
+        return False
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 16), b""):
+            digest.update(chunk)
+    return digest.hexdigest() == str(expected).strip().lower()
+
+
+def fetch_pack(source, cache_dir, reporter=None):
+    """Return a local path to the pack archive, downloading it if needed.
+
+    A file already in the cache is used only if it still matches the hash: 133 MB
+    is not a thing to fetch twice because the launcher restarted, and a truncated
+    one is not a thing to trust because it has the right name.
+    """
+    url = (source or {}).get("url")
+    want = (source or {}).get("sha256")
+    if not url or not want:
+        raise PackError("the manifest has no source url and sha256 to fetch")
+
+    if not os.path.isdir(cache_dir):
+        os.makedirs(cache_dir)
+    target = os.path.join(cache_dir, os.path.basename(url.split("?", 1)[0]) or "pack.tar.gz")
+
+    if os.path.isfile(target) and verify_sha256(target, want):
+        return target
+
+    part = target + ".part"
+    try:
+        with contextlib.closing(urllib.request.urlopen(url)) as response:
+            total = int(response.headers.get("Content-Length") or 0)
+            done = 0
+            with open(part, "wb") as fh:
+                while True:
+                    chunk = response.read(1 << 16)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    done += len(chunk)
+                    if reporter:
+                        reporter(done, total)
+    except PackError:
+        raise
+    except Exception as exc:
+        _remove(part)
+        raise PackError("could not download %s: %s" % (url, exc))
+
+    if not verify_sha256(part, want):
+        # Leave nothing a later run could mistake for a good file.
+        _remove(part)
+        _remove(target)
+        raise PackError(
+            "sha256 of the downloaded archive does not match the manifest - "
+            "the download was corrupted, or the release was replaced")
+    os.replace(part, target)
+    return target
+
+
+def _remove(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _inside(root, path):
+    return path == root or path.startswith(root + os.sep)
+
+
+def _member_stays_inside(member, dest, root):
+    """Every path an archive gives us is data from the internet.
+
+    Two things here are not obvious, and both were wrong when this was a pass
+    over the member list before anything was written.
+
+    A member's own name is resolved against the destination *as it stands*, so a
+    symlink an earlier member planted is followed the way tar itself will follow
+    it. Reading the whole list first cannot see that: `up -> .` looks harmless,
+    and `up/../../evil` then resolves through it to the destination's parent.
+
+    A symlink's target is resolved against the link's own directory, because
+    that is where the system will resolve it. Joining it to the destination root
+    instead calls every ../.. inside a Wine tree or a dylib layout an attack. A
+    hardlink is the other way round: its target names another member, so it is
+    relative to the root.
+    """
+    if os.path.isabs(member.name) or os.path.isabs(member.linkname or ""):
+        return False
+    if not _inside(root, os.path.realpath(os.path.join(dest, member.name))):
+        return False
+    if member.issym():
+        base = os.path.dirname(os.path.join(dest, member.name))
+        return _inside(root, os.path.realpath(os.path.join(base, member.linkname)))
+    if member.islnk():
+        return _inside(root, os.path.realpath(os.path.join(dest, member.linkname)))
+    return True
+
+
+def unpack(archive, dest):
+    """Replace `dest` with the archive's contents, and return its root directory.
+
+    Replace rather than merge: an older pack's leftovers inside a new one is a
+    debugging session nobody should have to have.
+    """
+    if os.path.exists(dest):
+        shutil.rmtree(dest)
+    os.makedirs(dest)
+    root = os.path.realpath(dest)
+    try:
+        with contextlib.closing(tarfile.open(archive, "r:*")) as tf:
+            members = tf.getmembers()
+            # Python's filter quietly makes an absolute name relative, the way
+            # GNU tar does. Safe, but a pack that ships one is broken and should
+            # hear about it rather than be silently rewritten.
+            for member in members:
+                if os.path.isabs(member.name) or os.path.isabs(member.linkname or ""):
+                    raise PackError(
+                        "the archive contains %r, an absolute path, which no pack "
+                        "has any reason to ship" % (member.name,))
+            if hasattr(tarfile, "data_filter"):
+                # Python's own check, and it looks at the disk rather than at the
+                # member list, which is what makes it see a symlink planted by an
+                # earlier member. It also strips setuid bits and refuses device
+                # nodes - neither of which an archive off the internet has any
+                # business carrying. Present from 3.12, and backported to
+                # 3.8.17, 3.9.17, 3.10.12 and 3.11.4.
+                tf.extractall(dest, members=members, filter="data")
+            else:
+                # The 3.9.6 that ships with the command line tools has no filter,
+                # so each member is checked against the destination at the moment
+                # it is written, not against a list read beforehand.
+                for member in members:
+                    if member.isdev():
+                        raise PackError(
+                            "the archive contains a device node, %r, which no "
+                            "pack has any reason to ship" % (member.name,))
+                    if not _member_stays_inside(member, dest, root):
+                        raise PackError(
+                            "the archive contains %r, which points outside the "
+                            "directory it is being unpacked into" % (member.name,))
+                    tf.extract(member, dest)
+    except PackError:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
+    except tarfile.TarError as exc:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise PackError("could not unpack %s: %s" % (archive, exc))
+
+    # A tarball built on macOS carries an AppleDouble `._name` beside every entry
+    # whose file had extended attributes, and our own releases are built on macOS.
+    # Counting one of those as a second root left the pack's commands running a
+    # directory too high, where `bash setup.sh` is "No such file or directory".
+    entries = [e for e in os.listdir(dest)
+               if not e.startswith("._") and e != ".DS_Store"]
+    if len(entries) == 1 and os.path.isdir(os.path.join(dest, entries[0])):
+        return os.path.join(dest, entries[0])
+    return dest
+
+
+# ----------------------------------------------------------------------------
+# the launch shim: the one thing a bundle calls
+
+# Interpreters a launch command may legitimately start with; anything else that
+# has no slash in it is a script sitting in the home and needs a ./ to be found.
+_INTERPRETERS = ("sh", "bash", "zsh", "python3", "env", "/usr/bin/env")
+
+UPDATE_CHECK_SECONDS = 21600  # six hours
+
+
+def _launch_command_in_home(command):
+    parts = shlex.split(command)
+    if not parts:
+        return ""
+    head = parts[0]
+    if head not in _INTERPRETERS and "/" not in head:
+        parts[0] = "./" + head
+    return " ".join(shlex.quote(p) if " " in p else p for p in parts)
+
+
+def _github_api_url(source):
+    """https://github.com/OWNER/REPO/releases/download/... -> the releases API."""
+    url = (source or {}).get("url") or ""
+    marker = "https://github.com/"
+    if not url.startswith(marker):
+        return ""
+    rest = url[len(marker):].split("/")
+    if len(rest) < 2:
+        return ""
+    return "https://api.github.com/repos/%s/%s/releases/latest" % (rest[0], rest[1])
+
+
+def shim_text(paths, manifest, check_updates=True):
+    """The script, as text. Returns "" for a pack that declares no way to launch.
+
+    check_updates is the config switch. It was documented, parsed and ignored,
+    which is the worst shape a setting can take: the person who turns it off for
+    privacy, for an offline machine or for GitHub's rate limit is told it worked.
+    """
+    game = manifest["game"]
+    name, game_id = game["name"], game["id"]
+    launch = (manifest["commands"] or {}).get("launch") or ""
+    if not launch:
+        return ""
+
+    api = _github_api_url(manifest.get("source"))
+    version = ((manifest.get("source") or {}).get("version")) or ""
+    marker = os.path.join(paths.game_cache(game_id), "update-check")
+
+    out = []
+    add = out.append
+    add("#!/bin/sh")
+    add("# satoru launch shim for %s. Generated by satoru - edits are lost on update." % name)
+    add("# The bundle calls this and nothing else, so updating the pack never rewrites")
+    add("# the .app: the icon stays put in the Dock and Spotlight has nothing to reindex.")
+    add("")
+    add('HERE=$(cd "$(dirname "$0")" && pwd -P)')
+    add("")
+    add("# App Translocation. A quarantined bundle is mounted read-only at a random path,")
+    add("# and a Wine prefix that cannot be written to fails in confusing ways rather than")
+    add("# obvious ones. Apple provides no supported way to detect this, so the executable's")
+    add("# own path is the only signal there is.")
+    add('case "$HERE" in')
+    add("  */AppTranslocation/*)")
+    add('    msg="macOS started this game from a read-only copy, so nothing it saves would be kept."')
+    add('    fix="Move the app into Applications in Finder - one at a time, not several at once - then open it again."')
+    add('    printf \'%s\\n%s\\n\' "$msg" "$fix" >&2')
+    add("    # Finder gives a launched app no terminal, so stderr goes nowhere and the")
+    add("    # alert is the only way to be heard. From a terminal the text above is")
+    add("    # already visible, and a dialog would just be in the way.")
+    add('    if [ -z "${TERM:-}" ]; then')
+    add('      osascript -e "display alert \\"$msg\\" message \\"$fix\\"" >/dev/null 2>&1 || true')
+    add("    fi")
+    add("    exit 10")
+    add("    ;;")
+    add("esac")
+    add("")
+    add("# Warmed shader pipelines live in the home, where the system is not allowed to")
+    add("# reclaim them. Overwatch alone keeps 434 MB of them. Nothing else makes this")
+    add("# directory: DXMT is handed an absolute path and opens a file inside it, so a")
+    add("# missing one loses the pipelines quietly, which is the whole thing this avoids.")
+    add("mkdir -p %s 2>/dev/null || true" % shlex.quote(paths.shader_cache(name)))
+    add('export DXMT_SHADER_CACHE_PATH=%s' % shlex.quote(paths.shader_cache(name) + "/"))
+    add('export SATORU_GAME_HOME="$HERE"')
+    add("export SATORU_GAME_ID=%s" % shlex.quote(game_id))
+    # The contract names one environment, not one for installing and a thinner
+    # one for launching. An author who writes "$SATORU_LOGS/game.log" in a launch
+    # command had it work at install time and vanish here, which shows up as an
+    # empty log and no explanation.
+    add("export SATORU_LIBRARY=%s" % shlex.quote(paths.library))
+    add("export SATORU_CACHE=%s" % shlex.quote(paths.game_cache(game_id)))
+    add("mkdir -p %s 2>/dev/null || true" % shlex.quote(paths.game_logs(game_id)))
+    add("export SATORU_LOGS=%s" % shlex.quote(paths.game_logs(game_id)))
+    add("export SATORU_CONTRACT=%s" % shlex.quote(str(CONTRACT)))
+    add("")
+    if api and check_updates:
+        add("# Update check. Started detached and never waited for: the game starts now and")
+        add("# the answer is read by the launcher on some later run. Offline, a rate-limited")
+        add("# API or a broken marker all cost exactly nothing here.")
+        add("MARK=%s" % shlex.quote(marker))
+        add('NOW=$(date +%s)')
+        add('THEN=$(stat -f %m "$MARK" 2>/dev/null || echo 0)')
+        add('if [ "$(( NOW - THEN ))" -gt %d ]; then' % UPDATE_CHECK_SECONDS)
+        add('  mkdir -p "$(dirname "$MARK")"')
+        add("  (")
+        add("    latest=$(curl -fsSL --max-time 20 %s 2>/dev/null \\" % shlex.quote(api))
+        add("      | sed -n 's/.*\"tag_name\"[^\"]*\"\\([^\"]*\\)\".*/\\1/p' | head -1)")
+        add('    if [ -n "$latest" ] && [ "$latest" != %s ]; then' % shlex.quote(version))
+        add('      printf \'%s\\n\' "$latest" > "$MARK"')
+        add("    else")
+        add('      : > "$MARK"')
+        add("    fi")
+        add("  ) >/dev/null 2>&1 </dev/null &")
+        add("fi")
+        add("")
+    add('cd "$HERE" || exit 1')
+    plain = (manifest["commands"] or {}).get("launch_plain") or ""
+    if plain and plain.split() != (launch + " --plain").split():
+        # launch_plain names a command. Treating it as a flag - any value meaning
+        # "run launch with --plain" - silently ran the wrong thing for a pack
+        # whose plain mode is a different script.
+        add('if [ "${1:-}" = "--plain" ]; then')
+        add("  shift")
+        add("  exec sh -c %s satoru-launch \"$@\""
+            % shlex.quote(_launch_command_in_home(plain) + ' "$@"'))
+        add("fi")
+    add("exec sh -c %s satoru-launch \"$@\"" % shlex.quote(_launch_command_in_home(launch) + ' "$@"'))
+    add("")
+    return "\n".join(out)
+
+
+def newer_version(paths, game_id):
+    """The tag the shim's update check found, or None.
+
+    The check has been running since the shim was written, spending one of
+    GitHub's sixty calls an hour to leave its answer in a file. Nothing read it,
+    which made the whole feature a cost with no benefit, and made the line the
+    contract promises - "there is a v0.2" - something no user could ever see.
+    """
+    marker = os.path.join(paths.game_cache(game_id), "update-check")
+    try:
+        with open(marker, encoding="utf-8") as fh:
+            tag = fh.read().strip()
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    return tag or None
+
+
+def write_shim(paths, manifest, write=True, check_updates=True):
+    """Write the shim into the game's home. Returns its path, or None if the pack
+    declares no launch command (a work-in-progress pack, honestly)."""
+    text = shim_text(paths, manifest, check_updates=check_updates)
+    if not text:
+        return None
+    if not write:
+        return text
+    home = paths.home(manifest["game"]["name"])
+    if not os.path.isdir(home):
+        os.makedirs(home)
+    path = os.path.join(home, "launch")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.chmod(path, 0o755)
+    return path
+
+
+# ----------------------------------------------------------------------------
+# the install pipeline
+
+
+class SubprocessRunner(object):
+    """Runs a pack's command and streams its output, line by line, to a callback."""
+
+    def run(self, command, cwd=None, env=None, on_output=None):
+        proc = subprocess.Popen(
+            ["bash", "-c", command], cwd=cwd, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        try:
+            for raw in iter(proc.stdout.readline, b""):
+                line = raw.decode("utf-8", "replace").rstrip("\n")
+                if on_output:
+                    on_output(line)
+        finally:
+            proc.stdout.close()
+        return proc.wait()
+
+
+def strip_quarantine(path):
+    """A browser-downloaded archive carries com.apple.quarantine, and the pack's
+    own preflight runs an ad-hoc-signed binary that Gatekeeper would then kill.
+    We downloaded it, so removing the flag is ours to do."""
+    with open(os.devnull, "wb") as null:
+        subprocess.call(["xattr", "-dr", "com.apple.quarantine", path],
+                        stdout=null, stderr=null)
+
+
+def _install_result(ok, step, message="", code=0, **extra):
+    out = {"ok": ok, "step": step, "message": message, "code": code}
+    out.update(extra)
+    return out
+
+
+# Contract v1 gives these five codes a meaning of their own, and everything else
+# one meaning: whatever ran is not a contract-1 pack. The difference matters to
+# the reader - "this machine is missing something" sends them to fix it, while
+# "the pack cannot answer" sends them to update the pack - and it is the whole
+# reason the contract numbers its exits at all.
+CONTRACT_EXITS = {
+    10: "the pack says this machine is not ready for it",
+    11: "there is nothing here to do",
+    12: "the pack's own files are not the ones it expects - fetch it again",
+    20: "cancelled",
+    1: "the pack broke in a way it did not expect",
+}
+
+_EXIT_REASON = {10: "refused", 20: "refused", 11: "nothing-to-do",
+                12: "stale-files", 1: "failed"}
+
+
+def explain_exit(code, command, output=None):
+    """(reason, message) for the exit code a pack answered with.
+
+    The pack's own last words are appended where it has any: for code 10 the
+    contract says its message is shown as it wrote it, and for a pack that does
+    not speak the contract at all its complaint - `unknown flag --preflight` -
+    is the single most useful thing on the screen.
+    """
+    said = [line for line in (output or []) if line and line.strip()]
+    tail = said[-1].strip() if said else ""
+    if code in CONTRACT_EXITS:
+        message = CONTRACT_EXITS[code]
+        return _EXIT_REASON[code], (message + ": " + tail) if tail else message
+    message = ("this pack does not understand `%s` (exit %d) - it is probably "
+               "older than the manifest that points at it" % (command, code))
+    return "not-contract", (message + ": " + tail) if tail else message
+
+
+def _recorder(sink, on_output, keep=40):
+    """Feed the caller every line, and keep the tail for the failure message."""
+    def watcher(line):
+        sink.append(line)
+        del sink[:-keep]
+        if on_output:
+            on_output(line)
+    return watcher
+
+
+def _clean_up_after(paths, name):
+    """Remove the empty shell of a failed install; return what was left behind.
+
+    An install that got nowhere leaves directories we made and the pack did not
+    fill: Finder renders a .app with nothing in it as broken, and nothing records
+    it, so nobody would ever find it again. What the pack did write is a different
+    matter - that is its work, not ours to delete - so it stays, and its path is
+    returned to be named.
+    """
+    home, bundle = paths.home(name), paths.bundle(name)
+    if os.path.isdir(home) and os.listdir(home):
+        return home
+    for directory in (home, os.path.join(bundle, "Contents", "Resources"),
+                      os.path.join(bundle, "Contents"), bundle):
+        try:
+            os.rmdir(directory)
+        except OSError:
+            break
+    return ""
+
+
+def install_game(manifest, paths, probe=None, runner=None, fetch=None, unpack=None,
+                 unquarantine=None, on_output=None, check_updates=True):
+    """Install a game, in the one order that makes each failure cheap.
+
+    Requirements first, so a machine that cannot run the game never spends
+    133 MB finding out. Unquarantine before preflight, or the pack's own probe
+    is SIGKILLed. Preflight before the first write, so a refusal leaves nothing
+    half-built behind.
+    """
+    fetch = fetch or fetch_pack
+    unpack = unpack or globals()["unpack"]
+    unquarantine = unquarantine or strip_quarantine
+    runner = runner or SubprocessRunner()
+
+    game = manifest["game"]
+    name, game_id = game["name"], game["id"]
+    commands = manifest["commands"] or {}
+
+    # The volume the bytes land on is the bundle's, not the library's: per
+    # ADR-0001 the pack installs into the home inside the .app, and the library
+    # is only where a game's own files go. Measuring the library reports a
+    # roomy external disk while the engine fills the internal one.
+    requirements = check_requirements(manifest["requires"], probe=probe,
+                                      root=paths.home(name))
+    if not all_met(requirements):
+        unmet = [r for r in requirements if not r["ok"]]
+        return _install_result(False, "requirements", reason="requirements",
+                       requirements=requirements,
+                       message="; ".join(r["label"] + ": " + r["detail"] for r in unmet))
+
+    source = manifest.get("source")
+    if not source or not source.get("url"):
+        return _install_result(False, "source", reason="no-source",
+                       requirements=requirements,
+                       message="this pack declares no release to download - "
+                               "see its own instructions for installing it by hand")
+
+    cache = paths.game_cache(game_id)
+    try:
+        archive = fetch(source, cache, None)
+        unpacked = unpack(archive, os.path.join(cache, "unpacked"))
+    except PackError as exc:
+        return _install_result(False, "fetch", code=12, reason="stale-files",
+                       requirements=requirements, message=str(exc))
+
+    unquarantine(unpacked)
+
+    # The contract names these in the command environment, so they have to be
+    # there. A pack that believes the contract and writes "$SATORU_LOGS/install.log"
+    # would otherwise be the one to discover the promise was empty.
+    logs = paths.game_logs(game_id)
+    for d in (cache, logs):
+        if not os.path.isdir(d):
+            os.makedirs(d)
+
+    env = dict(os.environ)
+    env.update({
+        "SATORU_GAME_HOME": paths.home(name),
+        "SATORU_GAME_ID": game_id,
+        "SATORU_LIBRARY": paths.library,
+        "SATORU_CACHE": cache,
+        "SATORU_LOGS": logs,
+        "SATORU_CONTRACT": str(CONTRACT),
+    })
+
+    # 11 is the contract's word for "there is nothing here to do", and an install
+    # asked to run twice is the case it exists for. Treating it as a failure
+    # punishes the one author who read the exit codes and believed them.
+    nothing_to_do = False
+
+    preflight = commands.get("preflight")
+    if preflight:
+        said = []
+        code = runner.run(preflight, cwd=unpacked, env=env,
+                          on_output=_recorder(said, on_output))
+        if code == 11:
+            nothing_to_do = True
+        elif code != 0:
+            # Nothing has been written yet, and nothing should be: leaving a
+            # half-built home is what this whole ordering exists to prevent.
+            reason, message = explain_exit(code, preflight, said)
+            return _install_result(False, "preflight", code=code, reason=reason,
+                           requirements=requirements, message=message,
+                           output="\n".join(said))
+
+    install = commands.get("install")
+    if not install:
+        return _install_result(False, "install", reason="no-command",
+                       requirements=requirements,
+                       message="this pack declares no install command")
+
+    home = paths.home(name)
+    if not os.path.isdir(home):
+        os.makedirs(home)
+    said = []
+    code = 11 if nothing_to_do else runner.run(
+        install, cwd=unpacked, env=env, on_output=_recorder(said, on_output))
+    if code == 11:
+        nothing_to_do = True
+    elif code != 0:
+        reason, message = explain_exit(code, install, said)
+        leftovers = _clean_up_after(paths, name)
+        if leftovers:
+            # Half an engine is not ours to throw away, and nothing records it -
+            # the install did not finish - so the message is the only place it
+            # can be named.
+            message += " (what it wrote is still in %s)" % leftovers
+        return _install_result(False, "install", code=code, reason=reason,
+                       requirements=requirements, message=message,
+                       leftovers=leftovers, output="\n".join(said))
+
+    # The shim first: installed.toml is a claim, and the shim is what makes it
+    # true. Recorded first, a shim that fails to write - a full disk, a read-only
+    # volume - leaves the state file saying installed while the launcher looks for
+    # a launch script that is not there and says the opposite.
+    write_shim(paths, manifest, check_updates=check_updates)
+    entry = record_install(paths, manifest, (source or {}).get("sha256"))
+    if nothing_to_do:
+        return _install_result(True, "done", reason="nothing-to-do",
+                       requirements=requirements, entry=entry,
+                       message="%s was already installed; nothing needed doing"
+                               % name)
+    return _install_result(True, "done", reason="done", requirements=requirements,
+                   entry=entry)
+
+
+# ----------------------------------------------------------------------------
 # model
 
 
@@ -481,36 +1448,157 @@ def command_target(cmd):
     return resolve(words[0])
 
 
+# ----------------------------------------------------------------------------
+# where things go
+
+class Paths(object):
+    """The layout, in one place, so that no other code has to guess.
+
+    An installed game is a bundle in ~/Applications with its home *inside* it
+    (ADR-0001), so that it is one object a person can move, back up and throw
+    away. What is not inside it is the game's own files: 2.4 GB of ours against
+    45 GB of theirs. Those live in a library, and the library is what `root`
+    moves — that frees 96% of the space without taking the icon out of Launchpad.
+
+    Logs go where Console.app looks for them; the download cache goes where the
+    system already knows it is disposable. Neither follows `root`.
+    """
+
+    def __init__(self, home=None, root=None):
+        self.home_dir = home or os.path.expanduser("~")
+        lib = os.path.join(self.home_dir, "Library")
+        self.support = os.path.join(lib, "Application Support", "satoru")
+        self.caches = os.path.join(lib, "Caches", "satoru")
+        self.logs = os.path.join(lib, "Logs", "satoru")
+        self.applications = os.path.join(self.home_dir, "Applications", "satoru")
+        self.config_file = os.path.join(self.support, "config.toml")
+        self.installed_file = os.path.join(self.support, "installed.toml")
+        self.library = expand(root) if root else os.path.join(self.support, "library")
+
+    @staticmethod
+    def _checked(game_id):
+        """An id arrives in a manifest, and a manifest arrives off the internet."""
+        if not game_id or not _ID_OK.match(str(game_id)):
+            raise ValueError(
+                "%r is not a usable game id (lower-case letters, digits and dashes)"
+                % (game_id,))
+        return game_id
+
+    def bundle(self, name):
+        return os.path.join(self.applications, _bundle_filename(name))
+
+    def home(self, name):
+        """The game's home, inside its own bundle. Passed to the pack as
+        SATORU_GAME_HOME; everything the pack installs goes here and nowhere else."""
+        return os.path.join(self.bundle(name), "Contents", "Resources", "home")
+
+    def shader_cache(self, name):
+        """Inside the home, so that the system cannot reclaim it.
+
+        Warmed pipelines are the difference between a first match and a stutter
+        festival - 434 MB of them for Overwatch - and until now they sat in the
+        user cache directory, which macOS may purge whenever it likes.
+        """
+        return os.path.join(self.home(name), "shader-cache")
+
+    def game_cache(self, game_id):
+        return os.path.join(self.caches, self._checked(game_id))
+
+    def game_logs(self, game_id):
+        return os.path.join(self.logs, self._checked(game_id))
+
+
+def _bundle_filename(name):
+    """A display name is not a filename.
+
+    "/" cannot appear in one at all, and ":" is a separator to the classic Mac
+    APIs - Finder renders it back as "/", which is how a game called "A:B" ends
+    up looking like a directory.
+    """
+    clean = str(name).replace("/", "-").replace(":", "-").strip().lstrip(".")
+    clean = "".join(ch for ch in clean if ch >= " ")
+    return (clean or "untitled") + ".app"
+
+
+CONFIG_KEYS = ("root", "check_updates")
+
+
+def load_config(path):
+    """Never fails: a missing or broken config gives defaults and says what it saw."""
+    cfg = {"root": None, "check_updates": True, "warnings": []}
+    try:
+        data = load_toml(path)
+    except (IOError, OSError):
+        return cfg
+    except ValueError as exc:
+        cfg["warnings"].append("%s: %s" % (path, exc))
+        return cfg
+    for key, value in data.items():
+        if key not in CONFIG_KEYS:
+            cfg["warnings"].append("%s: unknown key %r" % (path, key))
+            continue
+        cfg[key] = value
+    if not isinstance(cfg["check_updates"], bool):
+        cfg["warnings"].append("%s: check_updates must be true or false" % path)
+        cfg["check_updates"] = True
+    return cfg
+
+
 class Game(object):
+    """One game as the launcher sees it, from either manifest shape.
+
+    A contract-1 manifest changes what Setup means. The pack stops naming a
+    script for the umbrella to shell out to and starts naming a release for it
+    to install, so the action is offered on the strength of [source] rather than
+    on a file existing at a path.
+    """
+
     def __init__(self, path, data):
-        g = data.get("game", {})
         self.path = path
         self.dir = os.path.dirname(path)
-        self.name = str(g.get("name", os.path.basename(self.dir)))
-        self.id = str(g.get("id", os.path.basename(self.dir)))
-        self.status = str(g.get("status", "wip"))
-        self.home = str(g.get("home", ""))
-        self.notes = str(g.get("notes", "")).strip()
-        self.cmds = {k: str(g.get(k, "")).strip() for k, _, _ in ACTIONS}
+        self.manifest, self.errors = parse_manifest(data)
+        game = self.manifest["game"]
+        self.contract = self.manifest["contract"]
+        self.name = game["name"] or os.path.basename(self.dir)
+        self.id = game["id"] or os.path.basename(self.dir)
+        self.status = game["status"]
+        self.summary = str(game["summary"]).strip()
+        self.notes = str(game["notes"]).strip()
+        self.source = self.manifest["source"]
+        install = self.manifest["install"]
+        self.home = install["home"]
+        self.manual_url = install["manual_url"]
+        self.foreign_note = install["foreign_note"]
+        commands, paths_ = self.manifest["commands"], self.manifest["paths"]
+        self.cmds = {
+            "setup": commands["install"],
+            "launch": commands["launch"],
+            "launch_plain": commands["launch_plain"],
+            "profile": paths_["profile"],
+            "logs": paths_["logs"],
+        }
 
     def validate(self):
-        errs = []
-        if "game" not in load_toml(self.path):
-            errs.append("no [game] table")
-        if self.status not in STATUSES:
-            errs.append("status %r not in %s" % (self.status, "/".join(STATUSES)))
-        if not self.name:
-            errs.append("empty name")
+        errs = list(self.errors)
         if self.id != os.path.basename(self.dir):
-            errs.append("id %r != directory %r" % (self.id, os.path.basename(self.dir)))
-        if self.status != "wip" and not self.cmds["launch"]:
+            errs.append("id %r does not match its directory %r"
+                        % (self.id, os.path.basename(self.dir)))
+        if self.contract == 0 and self.status != "wip" and not self.cmds["launch"]:
             errs.append("status %s but no launch command" % self.status)
         return errs
 
-    def action_state(self, key):
+    def installed_home(self, paths=None):
+        """Where this game would be, once installed. Only meaningful for v1."""
+        return (paths or Paths()).home(self.name)
+
+    def action_state(self, key, paths=None):
         """(state, detail): state is 'ok' | 'soon' | 'missing'."""
+        if self.status == "wip":
+            return "soon", ""
+        if self.contract >= 1:
+            return self._v1_action_state(key, paths)
         cmd = self.cmds.get(key, "")
-        if self.status == "wip" or not cmd:
+        if not cmd:
             return "soon", ""
         kind = dict((k, kind) for k, _, kind in ACTIONS)[key]
         if kind == "cmd":
@@ -523,6 +1611,39 @@ class Game(object):
             return "missing", target
         return "ok", target
 
+    def _v1_action_state(self, key, paths=None):
+        paths = paths or Paths()
+        # The home that was recorded, not one recomputed from today's display
+        # name: renaming a game in its manifest is a normal thing for an author
+        # to do, and it used to leave the install on disk with the launcher
+        # looking somewhere else and reporting it missing.
+        entry = installed_entry(paths, self.id)
+        home = (entry or {}).get("home") or paths.home(self.name)
+        if key == "setup":
+            if not self.source or not self.source.get("url"):
+                # An honest "there is no automatic install", not a broken manifest.
+                return "soon", ""
+            return "ok", "install %s (%s)" % (
+                self.name, self.source.get("version") or "latest")
+        if key in ("launch", "launch_plain"):
+            if not self.cmds.get(key):
+                return "soon", ""
+            shim = os.path.join(home, "launch")
+            if not os.path.isfile(shim):
+                # Nothing is missing: it has simply not been installed yet, and
+                # a path in the listing would read like something went wrong.
+                return "missing", "not installed yet"
+            return "ok", shim + (" --plain" if key == "launch_plain" else "")
+        target = self.cmds.get(key) or ""
+        if not target:
+            return "soon", ""
+        full = target if os.path.isabs(target) else os.path.join(home, target)
+        if not os.path.exists(full):
+            # Same reasoning as launch: before an install there is nothing to be
+            # missing, and a path here reads as a fault rather than a state.
+            return "missing", full if os.path.isdir(home) else "not installed yet"
+        return "ok", full
+
 
 def load_games(games_dir=GAMES_DIR):
     games = []
@@ -530,8 +1651,20 @@ def load_games(games_dir=GAMES_DIR):
         return games
     for entry in sorted(os.listdir(games_dir)):
         toml_path = os.path.join(games_dir, entry, "game.toml")
-        if os.path.isfile(toml_path):
-            games.append(Game(toml_path, load_toml(toml_path)))
+        if not os.path.isfile(toml_path):
+            continue
+        try:
+            data = load_toml(toml_path)
+        except (ValueError, OSError, UnicodeDecodeError) as exc:
+            # One pack's manifest is one pack's problem. Taking the catalogue
+            # down with it hides every other game behind a traceback, and the
+            # reader cannot even see which manifest was at fault.
+            game = Game(toml_path, {"game": {"id": entry, "name": entry,
+                                             "status": "wip"}})
+            game.errors = ["this manifest could not be read: %s" % exc]
+            games.append(game)
+            continue
+        games.append(Game(toml_path, data))
     # rc first, then playable, then wip; stable within a group
     order = {s: i for i, s in enumerate(STATUSES)}
     games.sort(key=lambda g: order.get(g.status, 99))
@@ -541,13 +1674,66 @@ def load_games(games_dir=GAMES_DIR):
 # ----------------------------------------------------------------------------
 # running things (outside curses)
 
+def current_paths():
+    """Paths as this machine's config says they are."""
+    base = Paths()
+    cfg = load_config(base.config_file)
+    return Paths(root=cfg["root"]) if cfg["root"] else base
+
+
+def _install_via_umbrella(game, paths):
+    """Contract v1: the umbrella installs the pack rather than shelling out to it."""
+    sys.stdout.write("Installing %s ...\n" % game.name)
+    sys.stdout.flush()
+
+    def echo(line):
+        sys.stdout.write("  " + line + "\n")
+        sys.stdout.flush()
+
+    result = install_game(game.manifest, paths, on_output=echo,
+                          check_updates=load_config(paths.config_file)["check_updates"])
+    if result["ok"]:
+        # Not "it is in Spotlight now": nothing here writes Info.plist yet, so
+        # what is on disk is a directory named .app that Finder shows as broken.
+        # Say where it went and offer the action that does work.
+        return 0, "%s installed into %s. Launch it from here; the Finder icon " \
+                  "comes with the bundle work." % (game.name, paths.bundle(game.name))
+    if result["step"] == "requirements":
+        unmet = [r for r in result["requirements"] if not r["ok"]]
+        lines = []
+        for req in unmet:
+            fix = req["fix"]
+            if fix and fix["kind"] == "command":
+                lines.append("%s: %s - run: %s" % (req["label"], req["detail"], fix["run"]))
+            elif fix:
+                lines.append("%s: %s - %s" % (req["label"], req["detail"], fix["hint"]))
+            else:
+                lines.append("%s: %s (nothing can change this)" % (req["label"], req["detail"]))
+        return 1, "cannot install here. " + "; ".join(lines)
+    return 1, "%s failed at %s: %s" % (game.name, result["step"], result["message"])
+
+
 def run_action(game, key):
     """Returns (returncode, message). Called with the terminal in normal mode."""
-    state, detail = game.action_state(key)
+    paths = current_paths()
+    state, detail = game.action_state(key, paths)
     if state == "soon":
+        if key == "setup" and game.manual_url:
+            # Not a dead button: there is a way to install this, it is just not ours.
+            return 0, "%s has no automatic install yet. Instructions: %s" % (
+                game.name, game.manual_url)
         return 0, "%s: SOON — not available for %s yet." % (key, game.name)
     if state == "missing":
+        if game.contract >= 1 and key in ("launch", "launch_plain"):
+            return 1, "%s is not installed yet - run Setup first." % game.name
         return 1, "%s: missing %s (submodule not checked out?)" % (key, detail)
+    if game.contract >= 1 and key == "setup":
+        return _install_via_umbrella(game, paths)
+    if game.contract >= 1 and key in ("launch", "launch_plain"):
+        args = ["--plain"] if key == "launch_plain" else []
+        shim = os.path.join(paths.home(game.name), "launch")
+        rc = subprocess.call([shim] + args)
+        return rc, "%s exited with %d." % (key, rc)
     kind = dict((k, kind) for k, _, kind in ACTIONS)[key]
     if kind == "file":
         pager = os.environ.get("PAGER", "less")
@@ -579,7 +1765,7 @@ def run_action(game, key):
 # ----------------------------------------------------------------------------
 # plain mode
 
-def describe(games, out=sys.stdout):
+def describe(games, out=sys.stdout, paths=None):
     if not games:
         out.write(NO_GAMES_HINT % GAMES_DIR)
         return
@@ -591,6 +1777,12 @@ def describe(games, out=sys.stdout):
                   % (", ".join(absent), "" if len(absent) == 1 else "s"))
     for g in games:
         out.write("%s [%s] — %s\n" % (g.name, g.id, STATUS_LABEL.get(g.status, g.status)))
+        # Every manifest writes one, and until now no reader had ever seen it.
+        if g.summary:
+            out.write("    %s\n" % g.summary)
+        newer = newer_version(paths or current_paths(), g.id)
+        if newer:
+            out.write("    %-32s %s\n" % ("Update available", newer))
         for key, label, _ in ACTIONS:
             state, detail = g.action_state(key)
             if state == "ok":
@@ -599,6 +1791,10 @@ def describe(games, out=sys.stdout):
                 out.write("    %-32s · SOON\n" % label)
             else:
                 out.write("    %-32s · missing: %s\n" % (label, detail))
+        if g.manual_url:
+            out.write("    %-32s %s\n" % ("Instructions", g.manual_url))
+        if g.foreign_note:
+            out.write("    %-32s %s\n" % ("Note", g.foreign_note))
         if g.notes:
             for line in g.notes.splitlines():
                 out.write("      %s\n" % line)
@@ -706,6 +1902,17 @@ def tui(stdscr, games):
                     put(y, 3, "%-32s · missing: %s" % (label, detail), attr | dim)
                 y += 1
             y += 1
+            if g.manual_url:
+                put(y, 3, "%-32s %s" % ("Instructions", g.manual_url), dim)
+                y += 1
+            if g.foreign_note:
+                # The one place the contract lets a pack say it writes outside
+                # its own home. It reached only the reader who ran --plain, which
+                # is the wrong half of the audience for a warning.
+                put(y, 3, "%-32s %s" % ("Note", g.foreign_note), curses.A_BOLD)
+                y += 1
+            if g.manual_url or g.foreign_note:
+                y += 1
             if g.notes:
                 put(y, 1, "Notes", curses.A_BOLD)
                 y += 1
