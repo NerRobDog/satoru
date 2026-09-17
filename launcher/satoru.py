@@ -904,6 +904,7 @@ class SystemProbe(object):
 TOOL_HINTS = {
     "ffmpeg": "brew install ffmpeg",
     "gh": "brew install gh",
+    "git-lfs": "brew install git-lfs",
     "dotnet": "install the .NET 8 SDK (arm64) from dotnet.microsoft.com",
     "python3": "xcode-select --install",
 }
