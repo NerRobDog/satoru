@@ -17,9 +17,13 @@ VERSION="${1:-$(cat VERSION 2>/dev/null || echo "")}"
 [ -n "$VERSION" ] || { echo "no version: pass one, or write a VERSION file" >&2; exit 2; }
 
 STAGE="dist/satoru-$VERSION"
-rm -rf "$STAGE"; mkdir -p "$STAGE/launcher" "$STAGE/games"
+rm -rf "$STAGE"; mkdir -p "$STAGE/launcher/assets" "$STAGE/games"
 
 cp launcher/satoru.py "$STAGE/launcher/"
+# The mark satoru puts on a .app when a pack does not name its own exe icon
+# (or extracting it fails). Without this, install_bundle_icon has nothing to
+# fall back to in a release tarball, even though it does in a git checkout.
+cp launcher/assets/satoru-default.icns "$STAGE/launcher/assets/"
 cp satoru.command "$STAGE/"
 cp LICENSE DONATE.md "$STAGE/"
 printf '%s\n' "$VERSION" > "$STAGE/VERSION"
