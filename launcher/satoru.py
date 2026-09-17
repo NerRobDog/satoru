@@ -696,9 +696,10 @@ def parse_modes(data, m, errors):
             # what means the same to both is allowed: no escapes, no Python-only
             # groups. A literal dot is [.], a digit is [0-9].
             if not isinstance(pattern, str) or "\\" in pattern or "(?" in pattern \
+                    or "[:" in pattern or "[=" in pattern or "[." in pattern \
                     or not _one_line_text(pattern):
                 errors.append("%s: pattern must be a one-line POSIX ERE without "
-                              "backslashes" % where)
+                              "backslashes or [:class:] names" % where)
                 ok = False
             else:
                 try:

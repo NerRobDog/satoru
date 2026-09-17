@@ -20,7 +20,7 @@ host    = "Создать сервер и играть"
 [setting_nick]                       # одна секция на параметр: setting_<имя>
 label   = "Ник"
 modes   = ["client", "host"]         # каким режимам нужен
-pattern = "[A-Za-z0-9_-]{1,16}"      # POSIX ERE, целиком, без обратных слэшей
+pattern = "[A-Za-z0-9_-]{1,16}"      # POSIX ERE, целиком, без \ и [:class:]
 error   = "Ник: латиница, цифры, _ или -, до 16 символов"
 
 [setting_server]

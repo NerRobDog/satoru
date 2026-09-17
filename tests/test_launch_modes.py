@@ -118,6 +118,11 @@ class TheManifest(unittest.TestCase):
         self.refused('[modes]\na = "A"\n[setting_n]\nlabel = "N"\nmodes = ["a"]\n'
                      "pattern = '\\d+'\n", "without backslashes")
 
+    def test_a_class_name_is_refused(self):
+        # grep -E knows [[:alpha:]], Python reads it as a set of characters.
+        self.refused('[modes]\na = "A"\n[setting_n]\nlabel = "N"\nmodes = ["a"]\n'
+                     'pattern = "[[:alpha:]]+"\n', "[:class:]")
+
     def test_a_pattern_that_does_not_compile_is_refused(self):
         self.refused('[modes]\na = "A"\n[setting_n]\nlabel = "N"\nmodes = ["a"]\n'
                      'pattern = "[a-"\n', "does not compile")

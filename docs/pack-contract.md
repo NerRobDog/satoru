@@ -168,8 +168,8 @@ modes = ["client"]
 Mode ids are lower-case letters, digits, `_` and `-`; setting names are
 lower-case letters, digits and `_`. Labels are one line and unique. `--check`
 refuses a setting that names an undeclared mode, an unknown `kind`, a `pattern`
-with a backslash (Python and `grep -E` read escapes differently, and both check
-it), a `pattern` on an `ipv4`, and `[setting_*]` without `[modes]`. A pattern is
+with a backslash or a `[:class:]` name (Python and `grep -E` read those
+differently, and both check it), a `pattern` on an `ipv4`, and `[setting_*]` without `[modes]`. A pattern is
 matched byte-wise when the game is started from Finder, so keep it to ASCII
 classes.
 
