@@ -190,29 +190,80 @@ class TheGuardActuallyFires(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.dir, ignore_errors=True)
 
-    def _run(self, env_extra):
+    def _run(self, env_extra, stderr_tty=False):
+        """Run the shim with a fake osascript first on PATH.
+
+        The fake records that it was called instead of putting a dialog on the
+        screen, so the no-terminal branch can be run for real on every pass.
+        TERM starts out absent, as it is for an app Finder launches.
+        """
         import subprocess
         path = satoru.write_shim(self.paths, self.manifest)
+        fake_bin = os.path.join(self.dir, "bin")
+        record = os.path.join(self.dir, "osascript-called")
+        os.makedirs(fake_bin, exist_ok=True)
+        fake = os.path.join(fake_bin, "osascript")
+        with open(fake, "w") as f:
+            f.write('#!/bin/sh\nprintf "%%s\\n" "$*" >> %s\n' % shlex.quote(record))
+        os.chmod(fake, 0o755)
         env = dict(os.environ)
         env.pop("TERM", None)
+        env["PATH"] = fake_bin + os.pathsep + env.get("PATH", "/usr/bin:/bin")
         env.update(env_extra)
-        proc = subprocess.Popen([path], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                env=env)
-        out, err = proc.communicate(timeout=30)
-        return proc.returncode, err.decode("utf-8", "replace")
+        if stderr_tty:
+            import pty
+            master, slave = pty.openpty()
+            proc = subprocess.Popen([path], stdout=subprocess.PIPE, stderr=slave, env=env)
+            os.close(slave)
+            # Read while the shim runs: on macOS a pty whose other end has gone
+            # away can drop what was still buffered in it.
+            import select
+            chunks = []
+            while True:
+                ready, _, _ = select.select([master], [], [], 30)
+                if not ready:
+                    break
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            proc.wait(timeout=30)
+            os.close(master)
+            err = b"".join(chunks)
+        else:
+            proc = subprocess.Popen([path], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    env=env)
+            _, err = proc.communicate(timeout=30)
+        return proc.returncode, err.decode("utf-8", "replace"), os.path.exists(record)
 
     def test_it_refuses_to_launch_and_says_why(self):
-        rc, err = self._run({"TERM": "dumb"})
+        rc, err, _ = self._run({})
         self.assertEqual(rc, 10)
         self.assertIn("read-only", err)
         self.assertIn("Applications", err)
 
+    def test_a_finder_launch_gets_the_alert(self):
+        # No TERM and no terminal on stderr is what Finder hands an app. /bin/sh
+        # on macOS is bash, which fills in TERM=dumb by itself, so a check for an
+        # empty TERM never sees this case and the user is told nothing at all.
+        rc, _, alerted = self._run({})
+        self.assertEqual(rc, 10)
+        self.assertTrue(alerted, "a launch with no terminal must show the alert")
+
     def test_a_terminal_run_gets_text_and_no_dialog(self):
         # A suite that pops a GUI alert on every run is a suite nobody runs.
-        text = satoru.write_shim(self.paths, self.manifest, write=False)
-        alert = index_of(text, "osascript")
-        gate = index_of(text, 'if [ -z "${TERM:-}" ]')
-        self.assertLess(gate, alert, "the alert must be behind the no-terminal check")
+        rc, err, alerted = self._run({"TERM": "xterm-256color"}, stderr_tty=True)
+        self.assertEqual(rc, 10)
+        self.assertIn("read-only", err)
+        self.assertFalse(alerted, "a terminal already shows the text")
+
+    def test_a_terminal_run_with_stderr_redirected_gets_no_dialog(self):
+        rc, _, alerted = self._run({"TERM": "xterm-256color"})
+        self.assertEqual(rc, 10)
+        self.assertFalse(alerted, "a real TERM means someone is at a terminal")
 
 
 if __name__ == "__main__":
