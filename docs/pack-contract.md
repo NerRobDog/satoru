@@ -89,13 +89,26 @@ launch_plain = "aoe4.sh --plain"    # a command, not a flag: it may be a differe
 uninstall    = "bash uninstall.sh"  # [planned]: satoru does not call this yet
 
 [paths]                             # paths relative to SATORU_GAME_HOME
-profile = "README-local.txt"        # what "Show profile" opens
-logs    = "logs"                    # what "Open logs" opens
+profile  = "README-local.txt"       # what "Show profile" opens
+logs     = "logs"                   # what "Open logs" opens
+icon_exe = "drive_c/Program Files/Game/Game.exe"   # optional, see below
 ```
 
 `foreign_note` is the one place the contract lets a pack admit that it writes
 somewhere other than its own home. Use it. It is shown before anyone commits to
 installing.
+
+`icon_exe` is optional, and a pack that omits it behaves exactly as one always
+has. When present, it names the Windows `.exe` — relative to
+`SATORU_GAME_HOME`, so typically somewhere under a `drive_c` your own
+`install` command creates — whose own icon satoru gives to the `.app`. It is
+read once `install` has finished (the exe has to exist by then), by parsing
+the exe's `RT_GROUP_ICON` / `RT_ICON` resources directly — no dependency
+beyond the Python standard library and macOS's own `sips`, and nothing here
+ever holds up an install: a missing exe, a `sips` this Mac does not have, or
+an exe with no icon resource all fall back the same way, silently, to a mark
+satoru drew for itself. `icon_exe` must resolve inside the game's own home;
+`..` or an absolute path is refused the same way a bad game id already is.
 
 `disk_gb` is your own footprint and nothing else. Space for the game's own files
 belongs to whoever brings them: a pack that installs through a store leaves that

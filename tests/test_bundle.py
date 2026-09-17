@@ -14,7 +14,7 @@ import stat
 import tempfile
 import unittest
 
-from support import satoru
+from support import satoru, build_pe_with_icon
 
 MANIFEST_TOML = (
     'contract = 1\n'
@@ -140,3 +140,168 @@ class InstallWritesTheBundle(unittest.TestCase):
         self.assertTrue(os.path.isfile(launch))
         self.assertTrue(
             os.path.isfile(os.path.join(self.paths.home("Age of Empires IV"), "launch")))
+
+
+ICON_MANIFEST_TOML = (
+    'contract = 1\n'
+    '[game]\nid = "aoe4"\nname = "Age of Empires IV"\nstatus = "rc"\n'
+    '[source]\nkind = "release"\n'
+    'url = "https://example.invalid/p.tar.gz"\n'
+    'sha256 = "abc"\nversion = "v0.2"\n'
+    '[commands]\nlaunch = "aoe4.sh"\n'
+    '[paths]\nicon_exe = "drive_c/Program Files/AoE4/AoE4.exe"\n'
+)
+
+
+def _stub_convert(marker):
+    """A fake `sips`: writes `marker` to dest and reports success, without
+    touching the filesystem beyond that - tests stay independent of whether
+    this machine actually has `sips` and of what it does with a fake .ico."""
+    def convert(src_path, dest_path):
+        with open(dest_path, "wb") as fh:
+            fh.write(marker)
+        return True
+    return convert
+
+
+def _failing_convert(src_path, dest_path):
+    return False
+
+
+class BundleIcon(unittest.TestCase):
+    """Every bundle satoru writes gets an icon now - the game's own, when a
+    pack names its exe, or satoru's own mark otherwise. Nothing here talks
+    to the real `sips`: `icon_convert` is the same kind of seam
+    `install_game` already gives `runner` and `fetch`.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.paths = satoru.Paths(home=self.dir)
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _manifest(self, toml=ICON_MANIFEST_TOML):
+        manifest, errors = satoru.parse_manifest(satoru._parse_minimal_toml(toml))
+        self.assertEqual(errors, [])
+        return manifest
+
+    def _icon_filename(self, bundle):
+        plist_path = os.path.join(bundle, "Contents", "Info.plist")
+        with open(plist_path, "rb") as fh:
+            info = plistlib.load(fh)
+        return info.get("CFBundleIconFile")
+
+    def test_no_icon_exe_falls_back_to_the_satoru_default(self):
+        manifest = self._manifest(
+            'contract = 1\n'
+            '[game]\nid = "aoe4"\nname = "Age of Empires IV"\nstatus = "rc"\n'
+            '[commands]\nlaunch = "aoe4.sh"\n')
+        bundle = satoru.write_bundle(self.paths, manifest)
+        icon_name = self._icon_filename(bundle)
+        self.assertEqual(icon_name, "aoe4.icns")
+        dest = os.path.join(bundle, "Contents", "Resources", icon_name)
+        with open(dest, "rb") as fh:
+            got = fh.read()
+        with open(satoru.DEFAULT_ICON_ASSET, "rb") as fh:
+            want = fh.read()
+        self.assertEqual(got, want)
+
+    def test_icon_exe_present_uses_the_games_own_icon(self):
+        manifest = self._manifest()
+        home = self.paths.home(manifest["game"]["name"])
+        exe_dir = os.path.join(home, "drive_c", "Program Files", "AoE4")
+        os.makedirs(exe_dir)
+        pe_bytes, _ = build_pe_with_icon(bits=32)
+        with open(os.path.join(exe_dir, "AoE4.exe"), "wb") as fh:
+            fh.write(pe_bytes)
+
+        marker = b"an .icns sips would have produced"
+        bundle = satoru.write_bundle(self.paths, manifest,
+                                      icon_convert=_stub_convert(marker))
+        icon_name = self._icon_filename(bundle)
+        self.assertEqual(icon_name, "aoe4.icns")
+        dest = os.path.join(bundle, "Contents", "Resources", icon_name)
+        with open(dest, "rb") as fh:
+            self.assertEqual(fh.read(), marker)
+
+    def test_icon_exe_outside_the_home_is_refused(self):
+        for traversal in ("../../etc/passwd", "/etc/passwd", "~/secrets"):
+            manifest = self._manifest(
+                'contract = 1\n'
+                '[game]\nid = "aoe4"\nname = "Age of Empires IV"\nstatus = "rc"\n'
+                '[commands]\nlaunch = "aoe4.sh"\n'
+                '[paths]\nicon_exe = "%s"\n' % traversal)
+            self.assertIsNone(
+                satoru._icon_source_path(self.paths, manifest),
+                "must refuse %r" % traversal)
+            # And the bundle must still get an icon - the safe default -
+            # rather than fail or leave the generic one.
+            bundle = satoru.write_bundle(
+                self.paths, manifest,
+                icon_convert=_stub_convert(b"should never be called"))
+            self.assertEqual(self._icon_filename(bundle), "aoe4.icns")
+
+    def test_a_failed_extraction_keeps_a_previously_installed_icon(self):
+        manifest = self._manifest()
+        home = self.paths.home(manifest["game"]["name"])
+        exe_dir = os.path.join(home, "drive_c", "Program Files", "AoE4")
+        os.makedirs(exe_dir)
+        pe_bytes, _ = build_pe_with_icon(bits=32)
+        with open(os.path.join(exe_dir, "AoE4.exe"), "wb") as fh:
+            fh.write(pe_bytes)
+
+        good = b"the real icon, extracted once"
+        bundle = satoru.write_bundle(self.paths, manifest,
+                                      icon_convert=_stub_convert(good))
+        dest = os.path.join(bundle, "Contents", "Resources", "aoe4.icns")
+        with open(dest, "rb") as fh:
+            self.assertEqual(fh.read(), good)
+
+        # A later re-install where conversion breaks (sips missing, a bad
+        # exe) must not downgrade a working icon to the generic default.
+        satoru.write_bundle(self.paths, manifest, icon_convert=_failing_convert)
+        with open(dest, "rb") as fh:
+            self.assertEqual(fh.read(), good, "must keep the icon it already had")
+
+    def test_write_bundle_never_raises_when_sips_is_missing(self):
+        manifest = self._manifest()
+        home = self.paths.home(manifest["game"]["name"])
+        exe_dir = os.path.join(home, "drive_c", "Program Files", "AoE4")
+        os.makedirs(exe_dir)
+        pe_bytes, _ = build_pe_with_icon(bits=32)
+        with open(os.path.join(exe_dir, "AoE4.exe"), "wb") as fh:
+            fh.write(pe_bytes)
+
+        def convert_raises(src_path, dest_path):
+            raise OSError("[Errno 2] No such file or directory: 'sips'")
+
+        bundle = satoru.write_bundle(self.paths, manifest, icon_convert=convert_raises)
+        self.assertTrue(os.path.isdir(bundle))
+        # sips is "missing": no game icon, but still the satoru default.
+        self.assertEqual(self._icon_filename(bundle), "aoe4.icns")
+
+    def test_an_unchecked_game_id_never_raises_out_of_install_bundle_icon(self):
+        # parse_manifest keeps a manifest usable even with a bad id (it just
+        # records an error); install_bundle_icon must not turn that into a
+        # write outside Contents/Resources, or into an exception either.
+        manifest, _ = satoru.parse_manifest(satoru._parse_minimal_toml(
+            'contract = 1\n'
+            '[game]\nid = "../escaped"\nname = "Bad Id"\nstatus = "rc"\n'
+            '[commands]\nlaunch = "bad.sh"\n'))
+        resources = os.path.join(self.dir, "Resources")
+        os.makedirs(resources)
+        result = satoru.install_bundle_icon(self.paths, manifest, resources)
+        self.assertIsNone(result)
+        self.assertEqual(os.listdir(self.dir), ["Resources"])
+
+    def test_a_second_write_touches_the_bundle_so_finder_refreshes(self):
+        manifest = self._manifest(
+            'contract = 1\n'
+            '[game]\nid = "aoe4"\nname = "Age of Empires IV"\nstatus = "rc"\n'
+            '[commands]\nlaunch = "aoe4.sh"\n')
+        bundle = satoru.write_bundle(self.paths, manifest)
+        os.utime(bundle, (0, 0))  # pretend Finder cached this a long time ago
+        satoru.write_bundle(self.paths, manifest)
+        self.assertGreater(os.stat(bundle).st_mtime, 0)

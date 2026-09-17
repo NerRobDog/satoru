@@ -21,7 +21,9 @@ import plistlib
 import re
 import shlex
 import shutil
+import struct
 import tarfile
+import tempfile
 import urllib.request
 import subprocess
 import sys
@@ -474,7 +476,7 @@ _SOURCE_KEYS = ("kind", "url", "sha256", "size", "version", "check")
 _REQUIRES_KEYS = ("arch", "macos", "rosetta", "disk_gb", "tools")
 _INSTALL_KEYS = ("home_authoritative", "foreign_note", "manual_url", "home")
 _COMMAND_KEYS = ("preflight", "install", "launch", "launch_plain", "uninstall", "update")
-_PATH_KEYS = ("profile", "logs")
+_PATH_KEYS = ("profile", "logs", "icon_exe")
 
 # What the packs ship today: one flat [game] table with the commands inside it.
 # All four are this shape, so it stays supported rather than being a migration.
@@ -1683,7 +1685,7 @@ def write_shim(paths, manifest, write=True, check_updates=True):
     return path
 
 
-def bundle_info(manifest):
+def bundle_info(manifest, icon_filename=None):
     """Keys Finder, Spotlight and TCC read. One identifier per game, so a
     microphone prompt is attributed to the game and not to Terminal."""
     game = manifest["game"]
@@ -1708,6 +1710,8 @@ def bundle_info(manifest):
         "NSMicrophoneUsageDescription": why,
         "NSLocalNetworkUsageDescription": why,
     }
+    if icon_filename:
+        info["CFBundleIconFile"] = icon_filename
     minimum = (manifest.get("requires") or {}).get("macos") or ""
     match = re.fullmatch(r"\s*>=\s*(\d+(?:\.\d+)*)\s*", minimum)
     if match:
@@ -1757,7 +1761,242 @@ def bundle_launch_text(exec_path=None, cwd=None, extra_args=None):
     return "\n".join(out)
 
 
-def write_bundle(paths, manifest, exec_path=None, cwd=None, extra_args=None):
+# ----------------------------------------------------------------------------
+# the bundle's icon
+#
+# Two sources, tried in order, and neither is allowed to fail the install:
+# the game's own exe, when a pack names one (`[paths] icon_exe`), and
+# otherwise a mark this project drew for itself
+# (launcher/assets/satoru-default.icns). A pack is not required to name an
+# exe; every bundle still gets an icon rather than Finder's generic one.
+
+RT_ICON = 3
+RT_GROUP_ICON = 14
+DEFAULT_ICON_ASSET = os.path.join(ROOT, "launcher", "assets", "satoru-default.icns")
+
+
+def _read_struct(fh, fmt, offset):
+    fh.seek(offset)
+    size = struct.calcsize(fmt)
+    data = fh.read(size)
+    if len(data) != size:
+        raise ValueError("truncated at offset %d reading %r" % (offset, fmt))
+    return struct.unpack(fmt, data)
+
+
+def _pe_sections(fh):
+    """(sections, resource_dir_rva). sections is [(va, size_of_raw, ptr_to_raw), ...].
+
+    Reads only what it needs — DOS header, PE + optional header, the section
+    table — never the whole file: a game's own exe can be very large, and
+    everything this cares about lives in the first few kilobytes.
+    """
+    fh.seek(0)
+    if fh.read(2) != b"MZ":
+        raise ValueError("not a PE file (no MZ signature)")
+    (e_lfanew,) = _read_struct(fh, "<I", 0x3C)
+    fh.seek(e_lfanew)
+    if fh.read(4) != b"PE\0\0":
+        raise ValueError("no PE header at e_lfanew")
+    file_header_off = e_lfanew + 4
+    _, num_sections = _read_struct(fh, "<HH", file_header_off)
+    (size_opt,) = _read_struct(fh, "<H", file_header_off + 16)
+    opt_off = file_header_off + 20
+    (magic,) = _read_struct(fh, "<H", opt_off)
+    if magic == 0x10B:      # PE32
+        dd_off = opt_off + 96
+    elif magic == 0x20B:    # PE32+
+        dd_off = opt_off + 112
+    else:
+        raise ValueError("unknown optional header magic 0x%x" % magic)
+    rsrc_rva, rsrc_size = _read_struct(fh, "<II", dd_off + 2 * 8)
+    if not rsrc_rva or not rsrc_size:
+        raise ValueError("this exe has no resource directory")
+    sec_off = opt_off + size_opt
+    sections = []
+    for i in range(num_sections):
+        _, vsize, va, sraw, praw = _read_struct(fh, "<8sIIII", sec_off + i * 40)
+        sections.append((va, sraw, praw))
+    return sections, rsrc_rva
+
+
+def _rva_to_offset(sections, rva):
+    for va, sraw, praw in sections:
+        if va <= rva < va + sraw:
+            return praw + (rva - va)
+    raise ValueError("rva 0x%x is outside every section" % rva)
+
+
+def _read_resource_dir(fh, sections, dir_rva):
+    off = _rva_to_offset(sections, dir_rva)
+    _, _, _, _, named, idc = _read_struct(fh, "<IIHHHH", off)
+    fh.seek(off + 16)
+    entries = []
+    for _ in range(named + idc):
+        id_or_name, offset_to_data = struct.unpack("<II", fh.read(8))
+        entries.append((id_or_name, offset_to_data))
+    return entries
+
+
+def _find_id(entries, wanted_id):
+    for id_or_name, offset in entries:
+        if not (id_or_name & 0x80000000) and id_or_name == wanted_id:
+            return offset
+    return None
+
+
+def _resource_data(fh, sections, rsrc_rva, dir_offset):
+    """Follow a Type-level offset (a subdirectory) down through the one
+    name and the one language it has, to the raw bytes of the resource."""
+    names = _read_resource_dir(fh, sections, rsrc_rva + (dir_offset & 0x7FFFFFFF))
+    if not names:
+        return None
+    _, lang_off = names[0]
+    if lang_off & 0x80000000:
+        langs = _read_resource_dir(fh, sections, rsrc_rva + (lang_off & 0x7FFFFFFF))
+        if not langs:
+            return None
+        _, data_off = langs[0]
+    else:
+        data_off = lang_off
+    data_entry_off = _rva_to_offset(sections, rsrc_rva + data_off)
+    rva, size, _cp, _res = _read_struct(fh, "<IIII", data_entry_off)
+    fh.seek(_rva_to_offset(sections, rva))
+    return fh.read(size)
+
+
+def pe_best_icon_ico(exe_path):
+    """The exe's own icon, repacked as a single-image .ico, or None.
+
+    A Windows exe carries a whole family of sizes under RT_GROUP_ICON /
+    RT_ICON. Only the largest (by area, then by bit depth) is kept: it is
+    the one `sips` actually uses when given an .ico with several images,
+    so shipping the rest would only make the file bigger, not the result
+    better. Any malformed input — not a PE, no resources, a truncated
+    section — is a None, never an exception: the caller falls back.
+    """
+    try:
+        with open(exe_path, "rb") as fh:
+            sections, rsrc_rva = _pe_sections(fh)
+            root = _read_resource_dir(fh, sections, rsrc_rva)
+            group_type_off = _find_id(root, RT_GROUP_ICON)
+            icon_type_off = _find_id(root, RT_ICON)
+            if group_type_off is None or icon_type_off is None:
+                return None
+            group_bytes = _resource_data(fh, sections, rsrc_rva, group_type_off)
+            if not group_bytes:
+                return None
+            icon_names = _read_resource_dir(
+                fh, sections, rsrc_rva + (icon_type_off & 0x7FFFFFFF))
+
+            _, _, count = struct.unpack_from("<HHH", group_bytes, 0)
+            best = None
+            for i in range(count):
+                (bw, bh, colors, _res, planes, bitcount, byte_count, icon_id
+                 ) = struct.unpack_from("<BBBBHHIH", group_bytes, 6 + i * 14)
+                width, height = (bw or 256), (bh or 256)
+                score = (width * height, bitcount)
+                if best is not None and score <= best[0]:
+                    continue
+                icon_data_off = _find_id(icon_names, icon_id)
+                if icon_data_off is None:
+                    continue
+                img = _resource_data(fh, sections, rsrc_rva, icon_data_off)
+                if not img:
+                    continue
+                best = (score, bw, bh, colors, planes, bitcount, img)
+            if best is None:
+                return None
+            _, bw, bh, colors, planes, bitcount, img = best
+            header = struct.pack("<HHH", 0, 1, 1)
+            entry = struct.pack("<BBBBHHII", bw, bh, colors, 0, planes, bitcount,
+                                 len(img), 6 + 16)
+            return header + entry + img
+    except (OSError, ValueError, struct.error, IndexError):
+        return None
+
+
+def _icon_source_path(paths, manifest):
+    """Where the manifest's own `[paths] icon_exe` points, resolved against
+    the game's home - or None when the key is absent, or when it would step
+    outside that home. The manifest arrives off the internet; `..` and an
+    absolute path are refused the same way a bad game id already is."""
+    rel = ((manifest.get("paths") or {}).get("icon_exe") or "").strip()
+    if not rel:
+        return None
+    if os.path.isabs(rel) or rel.startswith("~"):
+        return None
+    home = os.path.abspath(paths.home(manifest["game"]["name"]))
+    candidate = os.path.abspath(os.path.join(home, rel))
+    if candidate != home and not candidate.startswith(home + os.sep):
+        return None
+    return candidate
+
+
+def _sips_to_icns(src_path, dest_path):
+    """The one external tool the icon feature needs. Any way it can fail —
+    the binary missing, an image it cannot read, a full disk — is the
+    caller's cue to fall back, not an exception to propagate."""
+    try:
+        with open(os.devnull, "wb") as null:
+            code = subprocess.call(
+                ["sips", "-s", "format", "icns", src_path, "--out", dest_path],
+                stdout=null, stderr=null)
+    except OSError:
+        return False
+    return code == 0 and os.path.isfile(dest_path) and os.path.getsize(dest_path) > 0
+
+
+def install_bundle_icon(paths, manifest, resources_dir, convert=_sips_to_icns):
+    """Best effort, in this order: the game's own icon, the icon already
+    sitting there from a previous install, satoru's own mark. Returns the
+    filename (relative to Contents/Resources) for CFBundleIconFile, or None
+    when even the fallback asset is missing. Never raises: a bundle must
+    still be written when every part of this fails.
+    """
+    try:
+        icns_name = "%s.icns" % Paths._checked(manifest["game"]["id"])
+    except Exception:
+        # A game id this broken never gets this far in practice - install_game
+        # rejects it long before a bundle is written - but this function's own
+        # promise is to never raise, so a filename that is not safe to use
+        # means no icon rather than a write outside Contents/Resources.
+        return None
+    dest = os.path.join(resources_dir, icns_name)
+    try:
+        exe = _icon_source_path(paths, manifest)
+        if exe and os.path.isfile(exe):
+            ico_bytes = pe_best_icon_ico(exe)
+            if ico_bytes:
+                tmp_fd, tmp_path = tempfile.mkstemp(suffix=".ico")
+                try:
+                    with os.fdopen(tmp_fd, "wb") as fh:
+                        fh.write(ico_bytes)
+                    if convert(tmp_path, dest):
+                        return icns_name
+                finally:
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+        # Extraction unavailable or failed this time: an icon a previous,
+        # successful install already left behind is still better than
+        # downgrading a working bundle to the generic mark.
+        if os.path.isfile(dest):
+            return icns_name
+    except Exception:
+        pass
+    try:
+        if os.path.isfile(DEFAULT_ICON_ASSET):
+            shutil.copyfile(DEFAULT_ICON_ASSET, dest)
+            return icns_name
+    except Exception:
+        pass
+    return None
+
+
+def write_bundle(paths, manifest, exec_path=None, cwd=None, extra_args=None,
+                  icon_convert=None):
     """Create or refresh the .app. Returns its path. Idempotent: a second
     Install updates the plist and launcher in place, it does not grow a twin."""
     name = manifest["game"]["name"]
@@ -1768,13 +2007,24 @@ def write_bundle(paths, manifest, exec_path=None, cwd=None, extra_args=None):
         os.makedirs(macos)
     if not os.path.isdir(resources):
         os.makedirs(resources)
+    if icon_convert is not None:
+        icon_filename = install_bundle_icon(paths, manifest, resources,
+                                             convert=icon_convert)
+    else:
+        icon_filename = install_bundle_icon(paths, manifest, resources)
     with open(os.path.join(bundle, "Contents", "Info.plist"), "wb") as fh:
-        plistlib.dump(bundle_info(manifest), fh)
+        plistlib.dump(bundle_info(manifest, icon_filename=icon_filename), fh)
     launch = os.path.join(macos, "launch")
     with open(launch, "w", encoding="utf-8") as fh:
         fh.write(bundle_launch_text(
             exec_path=exec_path, cwd=cwd, extra_args=extra_args))
     os.chmod(launch, 0o755)
+    # Finder caches an app's icon on the bundle itself; touch it so a changed
+    # icon is picked up instead of the one it saw the last time it looked.
+    try:
+        os.utime(bundle, None)
+    except OSError:
+        pass
     return bundle
 
 
