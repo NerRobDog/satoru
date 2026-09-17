@@ -1,0 +1,35 @@
+# A pack that declares launch modes, shaped like Prime World's. Used by
+# tests/test_launch_modes.py; the directory name is the game id.
+contract = 1
+
+[game]
+id      = "modes-pack"
+name    = "Modes Pack"
+status  = "playable"
+summary = "offline, join a server, or host one"
+
+[source]
+kind    = "release"
+url     = "https://github.com/NerRobDog/modes-pack/releases/download/v0.1/p.tar.gz"
+sha256  = "0000000000000000000000000000000000000000000000000000000000000000"
+version = "v0.1"
+
+[commands]
+launch       = "run.sh"
+launch_plain = "run.sh --plain"
+
+[modes]
+offline = "Оффлайн против ботов"
+client  = "Подключиться к серверу"
+host    = "Создать сервер и играть"
+
+[setting_nick]
+label   = "Ник"
+modes   = ["client", "host"]
+pattern = "[A-Za-z0-9_-]{1,16}"
+error   = "Ник: латиница, цифры, _ или -, до 16 символов"
+
+[setting_server]
+label = "IPv4-адрес сервера"
+kind  = "ipv4"
+modes = ["client"]

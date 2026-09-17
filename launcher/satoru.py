@@ -495,6 +495,8 @@ def _blank_manifest():
                     "manual_url": "", "home": ""},
         "commands": dict((k, "") for k in _COMMAND_KEYS),
         "paths": dict((k, "") for k in _PATH_KEYS),
+        "modes": [],
+        "settings": [],
     }
 
 
@@ -551,7 +553,8 @@ def parse_manifest(data):
                 errors.append("unknown section [%s]" % name)
     else:
         for name in data:
-            if name not in _V1_SECTIONS and name != "contract":
+            if (name not in _V1_SECTIONS and name not in ("contract", "modes")
+                    and not name.startswith(SETTING_SECTION)):
                 errors.append("unknown section [%s]" % name)
         m["game"].update(_take(data.get("game", {}), _GAME_KEYS, errors, "[game]"))
         m["requires"].update(
@@ -565,6 +568,7 @@ def parse_manifest(data):
             src = dict((k, None) for k in _SOURCE_KEYS)
             src.update(_take(data["source"], _SOURCE_KEYS, errors, "[source]"))
             m["source"] = src
+        parse_modes(data, m, errors)
 
     # --- what has to be true whichever shape it came in ---
     gid = m["game"]["id"]
@@ -601,6 +605,228 @@ def parse_manifest(data):
                     errors.append("[source] %s is required for kind = \"release\"" % k)
 
     return m, errors
+
+
+# ----------------------------------------------------------------------------
+# launch modes: an optional part of contract 1 (docs/launch-modes-design.md)
+#
+# A pack may offer several ways to start the same game - offline, join a server,
+# host one - and the values each way needs. satoru asks, remembers, validates and
+# hands the answer over in the environment; the pack's own commands stay
+# non-interactive. A pack without [modes] never sees any of it.
+
+SETTING_SECTION = "setting_"
+SETTING_KINDS = ("text", "ipv4")
+_SETTING_KEYS = ("label", "modes", "kind", "pattern", "error")
+_MODE_ID_OK = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+_SETTING_NAME_OK = re.compile(r"^[a-z0-9][a-z0-9_]*$")
+LAUNCH_STATE_FILE = "satoru-launch.conf"
+CHANGE_SETTINGS_LABEL = "Change settings\u2026"
+
+
+def _one_line_text(value):
+    return isinstance(value, str) and value.strip() != "" and not any(
+        ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value)
+
+
+def parse_modes(data, m, errors):
+    """[modes] and [setting_<name>] into m["modes"] and m["settings"].
+
+    The reader keeps keys in the order they were written, so one table gives
+    both the list and its labels without the arrays of tables the subset refuses.
+    """
+    setting_sections = [n for n in data if n.startswith(SETTING_SECTION)]
+    modes = data.get("modes")
+    if modes is None:
+        for name in setting_sections:
+            errors.append("[%s] needs a [modes] section to belong to" % name)
+        return
+    if not isinstance(modes, dict) or not modes:
+        errors.append("[modes] must name at least one mode: id = \"label\"")
+        return
+    labels = set()
+    for mode_id, label in modes.items():
+        if not _MODE_ID_OK.match(mode_id):
+            errors.append("[modes] %r: a mode id is lower-case letters, digits, _ and -"
+                          % mode_id)
+            continue
+        if not _one_line_text(label):
+            errors.append("[modes] %s: the label must be a non-empty one-line string"
+                          % mode_id)
+            continue
+        if label in labels or label == CHANGE_SETTINGS_LABEL:
+            errors.append("[modes] %s: the label %r is used twice" % (mode_id, label))
+            continue
+        labels.add(label)
+        m["modes"].append({"id": mode_id, "label": label})
+    ids = [mode["id"] for mode in m["modes"]]
+
+    for section in setting_sections:
+        where = "[%s]" % section
+        name = section[len(SETTING_SECTION):]
+        if not _SETTING_NAME_OK.match(name):
+            errors.append("%s: a setting name is lower-case letters, digits and _" % where)
+            continue
+        if not isinstance(data[section], dict):
+            errors.append("%s must be a section" % where)
+            continue
+        setting = {"name": name, "label": "", "modes": [], "kind": "text",
+                   "pattern": "", "error": ""}
+        setting.update(_take(data[section], _SETTING_KEYS, errors, where))
+        ok = True
+        if not _one_line_text(setting["label"]):
+            errors.append("%s: label is required, one line" % where)
+            ok = False
+        wanted = setting["modes"]
+        if (not isinstance(wanted, list) or not wanted
+                or not all(isinstance(x, str) for x in wanted)):
+            errors.append("%s: modes must list the modes that need it" % where)
+            ok = False
+        else:
+            for mode_id in wanted:
+                if mode_id not in ids:
+                    errors.append("%s: modes names %r, which [modes] does not declare"
+                                  % (where, mode_id))
+                    ok = False
+        if setting["kind"] not in SETTING_KINDS:
+            errors.append("%s: kind %r must be one of %s"
+                          % (where, setting["kind"], ", ".join(SETTING_KINDS)))
+            ok = False
+        pattern = setting["pattern"]
+        if pattern:
+            # Checked twice, by Python here and by grep -E in the shim, so only
+            # what means the same to both is allowed: no escapes, no Python-only
+            # groups. A literal dot is [.], a digit is [0-9].
+            if not isinstance(pattern, str) or "\\" in pattern or "(?" in pattern \
+                    or "[:" in pattern or "[=" in pattern or "[." in pattern \
+                    or not _one_line_text(pattern):
+                errors.append("%s: pattern must be a one-line POSIX ERE without "
+                              "backslashes or [:class:] names" % where)
+                ok = False
+            else:
+                try:
+                    re.compile(pattern)
+                except re.error as exc:
+                    errors.append("%s: pattern does not compile: %s" % (where, exc))
+                    ok = False
+            if setting["kind"] != "text":
+                errors.append("%s: pattern only applies to kind = \"text\"" % where)
+                ok = False
+        if setting["error"] and not _one_line_text(setting["error"]):
+            errors.append("%s: error must be one line" % where)
+            ok = False
+        if ok:
+            m["settings"].append(setting)
+
+
+def mode_settings(manifest, mode_id):
+    return [s for s in manifest.get("settings") or [] if mode_id in s["modes"]]
+
+
+def valid_ipv4(value):
+    parts = value.split(".")
+    if len(parts) != 4:
+        return False
+    for part in parts:
+        if (not part or len(part) > 3 or not part.isdigit() or not part.isascii()
+                or int(part) > 255):
+            return False
+    return True
+
+
+def setting_problem(setting, value):
+    """None when the value is usable, otherwise what to tell the person.
+
+    The shim asks the same questions in shell; the pack asks them a third time,
+    because it can be run without satoru at all.
+    """
+    label = setting["label"]
+    custom = setting.get("error") or ""
+    if not value:
+        return custom or "%s is required" % label
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        return custom or "%s must be one line of text" % label
+    if setting["kind"] == "ipv4" and not valid_ipv4(value):
+        return custom or "%s must be an IPv4 address, like 192.168.0.10" % label
+    if setting.get("pattern") and not re.fullmatch(setting["pattern"], value):
+        return custom or "%s is not in the expected form" % label
+    return None
+
+
+def read_launch_state(home):
+    """{"mode": id or "", "settings": {name: value}}. Never raises."""
+    state = {"mode": "", "settings": {}}
+    try:
+        with open(os.path.join(home, LAUNCH_STATE_FILE), encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return state
+    for line in lines:
+        if line.lstrip().startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key, value = key.strip(" \t"), value.strip(" \t")
+        if key == "mode":
+            state["mode"] = value
+        elif key.startswith(SETTING_SECTION):
+            state["settings"][key[len(SETTING_SECTION):]] = value
+    return state
+
+
+def write_launch_state(home, mode_id, values):
+    """Atomically; key = value lines, the same shape the shim writes and reads."""
+    lines = ["mode = %s" % mode_id]
+    for name in sorted(values):
+        value = values[name]
+        if value and "\n" not in value and "\r" not in value:
+            lines.append("%s%s = %s" % (SETTING_SECTION, name, value))
+    path = os.path.join(home, LAUNCH_STATE_FILE)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    os.replace(tmp, path)
+
+
+def launch_mode_default(manifest, state):
+    ids = [mode["id"] for mode in manifest.get("modes") or []]
+    if not ids:
+        return ""
+    return state["mode"] if state["mode"] in ids else ids[0]
+
+
+def setting_env_name(name):
+    return "SATORU_SETTING_" + name.upper()
+
+
+def resolve_launch_mode(manifest, home, mode_id, ask, say, force=False):
+    """Fill in what `mode_id` needs, save the choice, return the environment.
+
+    `ask(setting, current)` returns the answer or None for "cancel"; `say(text)`
+    tells the person why an answer was refused. Values already saved and still
+    valid are not asked again unless `force`. Returns None when cancelled.
+    """
+    state = read_launch_state(home)
+    values = dict(state["settings"])
+    wanted = (manifest.get("settings") or []) if force else mode_settings(manifest, mode_id)
+    for setting in wanted:
+        value = values.get(setting["name"], "")
+        problem = setting_problem(setting, value)
+        asked = False
+        while force and not asked or problem:
+            if problem and asked:
+                say(problem)
+            answer = ask(setting, value)
+            asked = True
+            if answer is None:
+                return None
+            value = answer.strip(" \t")
+            problem = setting_problem(setting, value)
+        values[setting["name"]] = value
+    write_launch_state(home, mode_id, values)
+    env = {"SATORU_MODE": mode_id}
+    for setting in mode_settings(manifest, mode_id):
+        env[setting_env_name(setting["name"])] = values[setting["name"]]
+    return env
 
 
 # ----------------------------------------------------------------------------
@@ -1148,8 +1374,11 @@ def shim_text(paths, manifest, check_updates=True):
         add("  ) >/dev/null 2>&1 </dev/null &")
         add("fi")
         add("")
-    add('cd "$HERE" || exit 1')
     plain = (manifest["commands"] or {}).get("launch_plain") or ""
+    if manifest.get("modes"):
+        out.extend(_mode_shim_lines(manifest, launch, plain))
+        return "\n".join(out)
+    add('cd "$HERE" || exit 1')
     if plain and plain.split() != (launch + " --plain").split():
         # launch_plain names a command. Treating it as a flag - any value meaning
         # "run launch with --plain" - silently ran the wrong thing for a pack
@@ -1162,6 +1391,261 @@ def shim_text(paths, manifest, check_updates=True):
     add("exec sh -c %s satoru-launch \"$@\"" % shlex.quote(_launch_command_in_home(launch) + ' "$@"'))
     add("")
     return "\n".join(out)
+
+
+# The part of the shim a pack with [modes] gets. Static shell with the manifest's
+# data written into case statements: no python at launch time (a clean macOS may
+# not have one), and nothing the manifest says is ever evaluated as code. Every
+# string that reaches osascript goes in through argv, never into the script text.
+_MODE_SHIM = r"""# Launch modes (docs/launch-modes-design.md). SATORU_MODE set by the caller -
+# satoru's TUI, a script - means no dialog; otherwise the person is asked here,
+# which is what a double click on the bundle does.
+STATE="$HERE/@STATE@"
+GAME_NAME=@GAME_NAME@
+MODE_IDS=@MODE_IDS@
+ALL_SETTINGS=@ALL_SETTINGS@
+CHANGE=@CHANGE@
+PROMPT=@PROMPT@
+
+mode_label() {
+  case "$1" in
+@MODE_LABEL_CASES@
+  esac
+}
+mode_by_label() {
+  case "$1" in
+@MODE_BY_LABEL_CASES@
+  esac
+  return 1
+}
+mode_settings() {
+  case "$1" in
+@MODE_SETTINGS_CASES@
+  esac
+}
+setting_field() {
+  case "$1:$2" in
+@SETTING_FIELD_CASES@
+  esac
+}
+
+trim() {
+  v=$1
+  v=${v#"${v%%[![:space:]]*}"}
+  v=${v%"${v##*[![:space:]]}"}
+  printf '%s' "$v"
+}
+state_get() {
+  [ -f "$STATE" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in \#*) continue ;; *=*) ;; *) continue ;; esac
+    if [ "$(trim "${line%%=*}")" = "$1" ]; then
+      trim "${line#*=}"
+      return 0
+    fi
+  done < "$STATE"
+}
+state_save() {
+  tmp="$STATE.tmp.$$"
+  {
+    printf 'mode = %s\n' "$MODE"
+    for name in $ALL_SETTINGS; do
+      eval "value=\${VAL_$name:-}"
+      [ -z "$value" ] || printf 'setting_%s = %s\n' "$name" "$value"
+    done
+  } > "$tmp" 2>/dev/null && mv -f "$tmp" "$STATE" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+}
+valid_ipv4() {
+  rest=$1 count=0
+  case "$rest" in ''|*[!0-9.]*|.*|*.|*..*) return 1 ;; esac
+  while [ -n "$rest" ]; do
+    case "$rest" in
+      *.*) part=${rest%%.*}; rest=${rest#*.} ;;
+      *) part=$rest; rest= ;;
+    esac
+    [ "${#part}" -le 3 ] && [ "$part" -le 255 ] 2>/dev/null || return 1
+    count=$((count + 1))
+  done
+  [ "$count" = 4 ]
+}
+# Prints why a value is refused and returns 1; silent and 0 when it is usable.
+setting_problem() {
+  label=$(setting_field "$1" label)
+  custom=$(setting_field "$1" error)
+  if [ -z "$2" ]; then
+    printf '%s' "${custom:-$label is required}"; return 1
+  fi
+  case "$2" in *[[:cntrl:]]*)
+    printf '%s' "${custom:-$label must be one line of text}"; return 1 ;;
+  esac
+  if [ "$(setting_field "$1" kind)" = ipv4 ] && ! valid_ipv4 "$2"; then
+    printf '%s' "${custom:-$label must be an IPv4 address, like 192.168.0.10}"; return 1
+  fi
+  pattern=$(setting_field "$1" pattern)
+  if [ -n "$pattern" ] && ! printf '%s\n' "$2" | /usr/bin/grep -Eqx -- "$pattern"; then
+    printf '%s' "${custom:-$label is not in the expected form}"; return 1
+  fi
+  return 0
+}
+
+osa_choose() {
+  osascript -e 'on run argv' -e 'activate' \
+    -e 'set r to choose from list (items 5 thru -1 of argv) with title (item 3 of argv) with prompt (item 4 of argv) default items {item 2 of argv} OK button name "Play" cancel button name "Cancel"' \
+    -e 'if r is false then return "cancel:"' -e 'return "ok:" & (item 1 of r)' \
+    -e 'end run' satoru "$@" 2>/dev/null
+}
+osa_ask() {
+  osascript -e 'on run argv' -e 'activate' -e 'try' \
+    -e 'set r to display dialog (item 4 of argv) default answer (item 2 of argv) with title (item 3 of argv) buttons {"Cancel", "OK"} default button "OK" cancel button "Cancel"' \
+    -e 'return "ok:" & (text returned of r)' -e 'on error number -128' -e 'return "cancel:"' -e 'end try' \
+    -e 'end run' satoru "$@" 2>/dev/null
+}
+osa_alert() {
+  osascript -e 'on run argv' -e 'activate' \
+    -e 'display alert (item 2 of argv) message (item 3 of argv) as critical' \
+    -e 'end run' satoru "$@" >/dev/null 2>&1 || true
+}
+no_dialog() {
+  printf '%s\n' "$GAME_NAME could not show its launch dialog." \
+    "Choose a mode in satoru, or set SATORU_MODE to one of: $MODE_IDS" >&2
+  exit 10
+}
+
+# ask_settings FORCE NAME... : ask for each value that is missing or refused (all
+# of them when FORCE is 1). Returns 20 when the person cancels.
+ask_settings() {
+  force=$1; shift
+  for name in "$@"; do
+    eval "value=\${VAL_$name:-}"
+    asked=0
+    while :; do
+      problem=$(setting_problem "$name" "$value") && [ "$force$asked" != 10 ] && break
+      [ "$asked" = 0 ] || [ -z "$problem" ] || osa_alert "$GAME_NAME" "$problem"
+      answer=$(osa_ask "$value" "$GAME_NAME" "$(setting_field "$name" label)") || no_dialog
+      case "$answer" in
+        cancel:*) return 20 ;;
+        ok:*) value=$(trim "${answer#ok:}") ;;
+        *) no_dialog ;;
+      esac
+      asked=1
+    done
+    eval "VAL_$name=\$value"
+  done
+  return 0
+}
+
+load_state() {
+  for name in $ALL_SETTINGS; do
+    eval "VAL_$name=\$(state_get setting_$name)"
+  done
+}
+load_state
+
+if [ -n "${SATORU_MODE:-}" ]; then
+  MODE=$SATORU_MODE
+  case " $MODE_IDS " in *" $MODE "*) ;; *)
+    printf '%s\n' "SATORU_MODE=$MODE is not a mode of $GAME_NAME: use one of $MODE_IDS" >&2
+    exit 10 ;;
+  esac
+  for name in $(mode_settings "$MODE"); do
+    eval "given=\${SATORU_SETTING_$(printf '%s' "$name" | tr a-z A-Z):-}"
+    [ -z "$given" ] || eval "VAL_$name=\$given"
+    eval "value=\${VAL_$name:-}"
+    if ! problem=$(setting_problem "$name" "$value"); then
+      printf '%s\n' "$problem" \
+        "Set SATORU_SETTING_$(printf '%s' "$name" | tr a-z A-Z), or choose in satoru." >&2
+      exit 10
+    fi
+  done
+else
+  command -v osascript >/dev/null 2>&1 || no_dialog
+  MODE=$(state_get mode)
+  case " $MODE_IDS " in *" $MODE "*) [ -n "$MODE" ] ;; *) false ;; esac || MODE=${MODE_IDS%% *}
+  while :; do
+    answer=$(osa_choose "$(mode_label "$MODE")" "$GAME_NAME" "$PROMPT" @CHOOSE_ITEMS@) || no_dialog
+    case "$answer" in
+      cancel:*) exit 20 ;;
+      ok:*) picked=${answer#ok:} ;;
+      *) no_dialog ;;
+    esac
+    if [ "$picked" = "$CHANGE" ]; then
+      # Cancelling a change goes back to the list with nothing changed.
+      if ask_settings 1 $ALL_SETTINGS; then state_save; else load_state; fi
+      continue
+    fi
+    MODE=$(mode_by_label "$picked") || no_dialog
+    ask_settings 0 $(mode_settings "$MODE") || exit 20
+    break
+  done
+fi
+
+state_save
+export SATORU_MODE="$MODE"
+for name in $(mode_settings "$MODE"); do
+  eval "export SATORU_SETTING_$(printf '%s' "$name" | tr a-z A-Z)=\"\$VAL_$name\""
+done
+
+cd "$HERE" || exit 1
+@PICK_COMMAND@
+# Not `[ -z "$TERM" ]`: /bin/sh sets TERM=dumb when it is unset, so under Finder
+# that test is never true. No terminal on stderr and no real TERM is a double click.
+if [ ! -t 2 ] && [ "${TERM:-dumb}" = dumb ]; then
+  # A double click gives the game no terminal, so a refusal written to stderr -
+  # a bad address, a missing file - would reach nobody. Keep it and show it.
+  ERR=$(mktemp -t satoru-launch 2>/dev/null) || ERR=/dev/null
+  sh -c "$COMMAND" satoru-launch "$@" 2>"$ERR"
+  rc=$?
+  if [ "$rc" != 0 ] && [ "$rc" != 20 ] && [ "$ERR" != /dev/null ]; then
+    osa_alert "$GAME_NAME" "$(tail -n 8 "$ERR")"
+  fi
+  [ "$ERR" = /dev/null ] || { cat "$ERR" >&2; rm -f "$ERR"; }
+  exit "$rc"
+fi
+exec sh -c "$COMMAND" satoru-launch "$@"
+"""
+
+
+def _mode_shim_lines(manifest, launch, plain):
+    q = shlex.quote
+    modes = [m for m in manifest["modes"] if _MODE_ID_OK.match(m["id"])]
+    settings = [s for s in manifest.get("settings") or []
+                if _SETTING_NAME_OK.match(s["name"])]
+    ids = [m["id"] for m in modes]
+    items = [m["label"] for m in modes] + ([CHANGE_SETTINGS_LABEL] if settings else [])
+    fields = []
+    for s in settings:
+        for field in ("label", "kind", "pattern", "error"):
+            if s.get(field):
+                fields.append("    %s) printf '%%s' %s ;;" % (q(s["name"] + ":" + field),
+                                                             q(str(s[field]))))
+    run = _launch_command_in_home(launch) + ' "$@"'
+    if plain and plain.split() != (launch + " --plain").split():
+        pick = ('if [ "${1:-}" = "--plain" ]; then\n  shift\n  COMMAND=%s\nelse\n'
+                '  COMMAND=%s\nfi' % (q(_launch_command_in_home(plain) + ' "$@"'), q(run)))
+    else:
+        pick = "COMMAND=%s" % q(run)
+    values = {
+        "@STATE@": LAUNCH_STATE_FILE,
+        "@GAME_NAME@": q(manifest["game"]["name"]),
+        "@MODE_IDS@": q(" ".join(ids)),
+        "@ALL_SETTINGS@": q(" ".join(s["name"] for s in settings)),
+        "@CHANGE@": q(CHANGE_SETTINGS_LABEL),
+        "@PROMPT@": q("How do you want to play %s?" % manifest["game"]["name"]),
+        "@MODE_LABEL_CASES@": "\n".join(
+            "    %s) printf '%%s' %s ;;" % (m["id"], q(m["label"])) for m in modes),
+        "@MODE_BY_LABEL_CASES@": "\n".join(
+            "    %s) printf '%%s' %s; return 0 ;;" % (q(m["label"]), m["id"]) for m in modes),
+        "@MODE_SETTINGS_CASES@": "\n".join(
+            "    %s) printf '%%s' %s ;;" % (m["id"], q(" ".join(
+                s["name"] for s in settings if m["id"] in s["modes"])))
+            for m in modes),
+        "@SETTING_FIELD_CASES@": "\n".join(fields) or "    *) ;;",
+        "@CHOOSE_ITEMS@": " ".join(q(i) for i in items),
+        "@PICK_COMMAND@": pick,
+    }
+    # One pass, so a label that happens to contain @SOMETHING@ is left alone.
+    text = re.sub(r"@[A-Z_]+@", lambda m: values.get(m.group(0), m.group(0)), _MODE_SHIM)
+    return text.split("\n")
 
 
 def newer_version(paths, game_id):
@@ -1692,12 +2176,45 @@ class Game(object):
             errs.append("status %s but no launch command" % self.status)
         return errs
 
+    def actions(self):
+        """ACTIONS, with Launch replaced by one entry per launch mode, if any."""
+        modes = self.manifest.get("modes") or []
+        if not modes or self.contract < 1:
+            return ACTIONS
+        out = [ACTIONS[0]]
+        for mode in modes:
+            out.append(("mode:" + mode["id"], "Launch: " + mode["label"], "cmd"))
+        if self.manifest.get("settings"):
+            out.append(("settings", CHANGE_SETTINGS_LABEL, "cmd"))
+        out.extend(ACTIONS[2:])
+        return out
+
+    def game_home(self, paths=None):
+        paths = paths or Paths()
+        entry = installed_entry(paths, self.id)
+        return (entry or {}).get("home") or paths.home(self.name)
+
+    def last_mode(self, paths=None):
+        """The mode the person chose last time, or the first one."""
+        return launch_mode_default(self.manifest, read_launch_state(self.game_home(paths)))
+
     def installed_home(self, paths=None):
         """Where this game would be, once installed. Only meaningful for v1."""
         return (paths or Paths()).home(self.name)
 
     def action_state(self, key, paths=None):
         """(state, detail): state is 'ok' | 'soon' | 'missing'."""
+        if key.startswith("mode:") or key == "settings":
+            state, detail = self.action_state("launch", paths)
+            if state != "ok":
+                return state, detail
+            if key == "settings":
+                return "ok", ", ".join(s["label"] for s in self.manifest["settings"])
+            mode_id = key[len("mode:"):]
+            names = [s["label"] for s in mode_settings(self.manifest, mode_id)]
+            last = " (last)" if mode_id == self.last_mode(paths) else ""
+            return "ok", "SATORU_MODE=%s%s%s" % (
+                mode_id, " + " + ", ".join(names) if names else "", last)
         if self.status == "wip":
             return "soon", ""
         if self.contract >= 1:
@@ -1815,6 +2332,45 @@ def _install_via_umbrella(game, paths):
     return 1, "%s failed at %s: %s" % (game.name, result["step"], result["message"])
 
 
+def _terminal_ask(setting, current):
+    """Enter keeps the current value. EOF or Ctrl-C is "cancel"."""
+    prompt = "%s [%s]: " % (setting["label"], current) if current else "%s: " % setting["label"]
+    try:
+        answer = input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        sys.stdout.write("\n")
+        return None
+    return answer if answer.strip() else current
+
+
+def _terminal_say(text):
+    sys.stdout.write("  %s\n" % text)
+    sys.stdout.flush()
+
+
+def launch_with_mode(game, paths, key, ask=None, say=None, call=None):
+    """TUI side of launch modes: ask here, in the terminal, then run the shim with
+    SATORU_MODE set so that it shows no dialog of its own. Returns (rc, message)."""
+    ask, say = ask or _terminal_ask, say or _terminal_say
+    call = call or subprocess.call
+    home = game.game_home(paths)
+    last = game.last_mode(paths)
+    if key == "settings":
+        env = resolve_launch_mode(game.manifest, home, last, ask, say, force=True)
+        if env is None:
+            return 20, "settings unchanged."
+        return 0, "settings saved for %s." % game.name
+    mode_id = key[len("mode:"):] if key.startswith("mode:") else last
+    env = resolve_launch_mode(game.manifest, home, mode_id, ask, say)
+    if env is None:
+        return 20, "cancelled; %s was not started." % game.name
+    full = dict(os.environ)
+    full.update(env)
+    args = ["--plain"] if key == "launch_plain" else []
+    rc = call([os.path.join(home, "launch")] + args, env=full)
+    return rc, "%s (%s) exited with %d." % (key, mode_id, rc)
+
+
 def run_action(game, key):
     """Returns (returncode, message). Called with the terminal in normal mode."""
     paths = current_paths()
@@ -1826,11 +2382,15 @@ def run_action(game, key):
                 game.name, game.manual_url)
         return 0, "%s: SOON — not available for %s yet." % (key, game.name)
     if state == "missing":
-        if game.contract >= 1 and key in ("launch", "launch_plain"):
+        if game.contract >= 1 and (key in ("launch", "launch_plain", "settings")
+                                   or key.startswith("mode:")):
             return 1, "%s is not installed yet - run Setup first." % game.name
         return 1, "%s: missing %s (submodule not checked out?)" % (key, detail)
     if game.contract >= 1 and key == "setup":
         return _install_via_umbrella(game, paths)
+    if game.contract >= 1 and game.manifest.get("modes") and (
+            key in ("launch", "launch_plain", "settings") or key.startswith("mode:")):
+        return launch_with_mode(game, paths, key)
     if game.contract >= 1 and key in ("launch", "launch_plain"):
         args = ["--plain"] if key == "launch_plain" else []
         entry = installed_entry(paths, game.id)
@@ -1886,8 +2446,8 @@ def describe(games, out=sys.stdout, paths=None, games_dir=GAMES_DIR):
         newer = newer_version(paths or current_paths(), g.id)
         if newer:
             out.write("    %-32s %s\n" % ("Update available", newer))
-        for key, label, _ in ACTIONS:
-            state, detail = g.action_state(key, paths or current_paths())
+        for key, label, _ in g.actions():
+            state, detail = g.action_state(key)
             if state == "ok":
                 out.write("    %-32s %s\n" % (label, detail))
             elif state == "soon":
@@ -1992,7 +2552,7 @@ def tui(stdscr, games):
             g = games[sel]
             put(y, 1, "Actions — %s" % g.name, curses.A_BOLD)
             y += 1
-            for i, (key, label, _) in enumerate(ACTIONS):
+            for i, (key, label, _) in enumerate(g.actions()):
                 state, detail = g.action_state(key)
                 cur = (mode == "actions" and i == action_sel)
                 attr = curses.A_REVERSE if cur else 0
@@ -2043,18 +2603,24 @@ def tui(stdscr, games):
             elif ch in (curses.KEY_ENTER, 10, 13, curses.KEY_RIGHT, ord("l")) and games:
                 mode = "actions"
                 action_sel = 0
+                g = games[sel]
+                if g.manifest.get("modes") and g.contract >= 1:
+                    # The last choice is where the cursor starts, as in the dialog.
+                    keys = [k for k, _, _ in g.actions()]
+                    last = "mode:" + g.last_mode()
+                    action_sel = keys.index(last) if last in keys else 0
                 message = ""
         else:
             if ch in (curses.KEY_DOWN, ord("j")):
-                action_sel = (action_sel + 1) % len(ACTIONS)
+                action_sel = (action_sel + 1) % len(games[sel].actions())
             elif ch in (curses.KEY_UP, ord("k")):
-                action_sel = (action_sel - 1) % len(ACTIONS)
+                action_sel = (action_sel - 1) % len(games[sel].actions())
             elif ch in (27, curses.KEY_LEFT, ord("h")):
                 mode = "games"
                 message = ""
             elif ch in (curses.KEY_ENTER, 10, 13):
                 g = games[sel]
-                key = ACTIONS[action_sel][0]
+                key = g.actions()[action_sel][0]
                 state, _ = g.action_state(key)
                 if state != "ok":
                     _, message = run_action(g, key)
