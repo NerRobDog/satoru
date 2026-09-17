@@ -1470,7 +1470,14 @@ def install_bundle_icon(paths, manifest, resources_dir, convert=_sips_to_icns):
     when even the fallback asset is missing. Never raises: a bundle must
     still be written when every part of this fails.
     """
-    icns_name = "%s.icns" % manifest["game"]["id"]
+    try:
+        icns_name = "%s.icns" % Paths._checked(manifest["game"]["id"])
+    except Exception:
+        # A game id this broken never gets this far in practice - install_game
+        # rejects it long before a bundle is written - but this function's own
+        # promise is to never raise, so a filename that is not safe to use
+        # means no icon rather than a write outside Contents/Resources.
+        return None
     dest = os.path.join(resources_dir, icns_name)
     try:
         exe = _icon_source_path(paths, manifest)

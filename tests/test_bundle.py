@@ -282,6 +282,20 @@ class BundleIcon(unittest.TestCase):
         # sips is "missing": no game icon, but still the satoru default.
         self.assertEqual(self._icon_filename(bundle), "aoe4.icns")
 
+    def test_an_unchecked_game_id_never_raises_out_of_install_bundle_icon(self):
+        # parse_manifest keeps a manifest usable even with a bad id (it just
+        # records an error); install_bundle_icon must not turn that into a
+        # write outside Contents/Resources, or into an exception either.
+        manifest, _ = satoru.parse_manifest(satoru._parse_minimal_toml(
+            'contract = 1\n'
+            '[game]\nid = "../escaped"\nname = "Bad Id"\nstatus = "rc"\n'
+            '[commands]\nlaunch = "bad.sh"\n'))
+        resources = os.path.join(self.dir, "Resources")
+        os.makedirs(resources)
+        result = satoru.install_bundle_icon(self.paths, manifest, resources)
+        self.assertIsNone(result)
+        self.assertEqual(os.listdir(self.dir), ["Resources"])
+
     def test_a_second_write_touches_the_bundle_so_finder_refreshes(self):
         manifest = self._manifest(
             'contract = 1\n'
