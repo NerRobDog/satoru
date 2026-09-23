@@ -89,13 +89,26 @@ launch_plain = "aoe4.sh --plain"    # a command, not a flag: it may be a differe
 uninstall    = "bash uninstall.sh"  # [planned]: satoru does not call this yet
 
 [paths]                             # paths relative to SATORU_GAME_HOME
-profile = "README-local.txt"        # what "Show profile" opens
-logs    = "logs"                    # what "Open logs" opens
+profile  = "README-local.txt"       # what "Show profile" opens
+logs     = "logs"                   # what "Open logs" opens
+icon_exe = "drive_c/Program Files/Game/Game.exe"   # optional, see below
 ```
 
 `foreign_note` is the one place the contract lets a pack admit that it writes
 somewhere other than its own home. Use it. It is shown before anyone commits to
 installing.
+
+`icon_exe` is optional, and a pack that omits it behaves exactly as one always
+has. When present, it names the Windows `.exe` — relative to
+`SATORU_GAME_HOME`, so typically somewhere under a `drive_c` your own
+`install` command creates — whose own icon satoru gives to the `.app`. It is
+read once `install` has finished (the exe has to exist by then), by parsing
+the exe's `RT_GROUP_ICON` / `RT_ICON` resources directly — no dependency
+beyond the Python standard library and macOS's own `sips`, and nothing here
+ever holds up an install: a missing exe, a `sips` this Mac does not have, or
+an exe with no icon resource all fall back the same way, silently, to a mark
+satoru drew for itself. `icon_exe` must resolve inside the game's own home;
+`..` or an absolute path is refused the same way a bad game id already is.
 
 `disk_gb` is your own footprint and nothing else. Space for the game's own files
 belongs to whoever brings them: a pack that installs through a store leaves that
@@ -137,6 +150,73 @@ the cache is documented as erasable and a launch anchored to the unpacked pack
 would break the first time it was cleaned.
 
 There is no interactivity. A command may not ask the person anything.
+
+## Launch modes (contract 1, optional)
+
+A pack whose game starts in more than one way — offline, joining a server,
+hosting one — declares those ways instead of asking. satoru shows them, asks for
+the values each one needs, remembers both, and hands the answer to `launch` and
+`launch_plain` in the environment. A pack without `[modes]` gets none of this,
+and its shim is byte for byte what it was.
+
+```toml
+[modes]                              # id = label; the order here is the order shown
+offline = "Offline against bots"
+client  = "Join a server"
+host    = "Host a server and play"
+
+[setting_nick]                       # one section per value: setting_<name>
+label   = "Nick"
+modes   = ["client", "host"]         # which modes need it; required
+kind    = "text"                     # text (default) | ipv4
+pattern = "[A-Za-z0-9_-]{1,16}"      # text only: POSIX ERE, whole value, no backslashes
+error   = "Latin letters, digits, _ or -, up to 16"   # shown when a value is refused
+
+[setting_server]
+label = "Server IPv4 address"
+kind  = "ipv4"
+modes = ["client"]
+```
+
+Mode ids are lower-case letters, digits, `_` and `-`; setting names are
+lower-case letters, digits and `_`. Labels are one line and unique. `--check`
+refuses a setting that names an undeclared mode, an unknown `kind`, a `pattern`
+with a backslash or a `[:class:]` name (Python and `grep -E` read those
+differently, and both check it), a `pattern` on an `ipv4`, and `[setting_*]` without `[modes]`. A pattern is
+matched byte-wise when the game is started from Finder, so keep it to ASCII
+classes.
+
+What your commands get, in addition to the environment above:
+
+```
+SATORU_MODE              the chosen mode id — set whenever the pack declares [modes]
+SATORU_SETTING_<NAME>    each value the chosen mode needs, <NAME> upper-cased
+```
+
+Only the chosen mode's values are exported. They have already passed the
+declared checks; check them again anyway, because your launcher can be run
+without satoru, and refuse the way the exit codes say.
+
+How the choice is made:
+
+- **The bundle, or `home/launch` run by hand**: a dialog (`osascript`, nothing
+  else) lists the modes with the last choice selected and a `Change settings…`
+  item. A value that is missing, or that the current manifest refuses, is asked
+  for; a refused one is explained and asked again. Cancel is exit 20 and starts
+  nothing. When no dialog can be shown, exit 10 names `SATORU_MODE`.
+- **satoru's TUI**: one `Launch: <label>` entry per mode, the cursor on the last
+  one; values are asked in the terminal. It then runs the shim with `SATORU_MODE`
+  set.
+- **Anyone who sets `SATORU_MODE`** (and `SATORU_SETTING_*`): no dialog; saved
+  values fill the gaps; anything still missing or refused is exit 10.
+
+The choice is kept in `SATORU_GAME_HOME/satoru-launch.conf` (`mode = …`,
+`setting_<name> = …`, one per line). It belongs to satoru; do not write it. It
+goes when the home goes and survives a reinstall.
+
+A pack with `[modes]` is refused as `unknown section [modes]` by a satoru older
+than this section, so the umbrella that understands it has to ship before a
+manifest that uses it.
 
 ## Exit codes
 

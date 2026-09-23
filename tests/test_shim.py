@@ -190,7 +190,7 @@ class TheGuardActuallyFires(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.dir, ignore_errors=True)
 
-    def _run(self, env_extra, stderr_tty=False):
+    def _run(self, env_extra, stderr_tty=False, path=None):
         """Run the shim with a fake osascript first on PATH.
 
         The fake records that it was called instead of putting a dialog on the
@@ -198,7 +198,7 @@ class TheGuardActuallyFires(unittest.TestCase):
         TERM starts out absent, as it is for an app Finder launches.
         """
         import subprocess
-        path = satoru.write_shim(self.paths, self.manifest)
+        path = path or satoru.write_shim(self.paths, self.manifest)
         fake_bin = os.path.join(self.dir, "bin")
         record = os.path.join(self.dir, "osascript-called")
         os.makedirs(fake_bin, exist_ok=True)
@@ -256,6 +256,30 @@ class TheGuardActuallyFires(unittest.TestCase):
     def test_a_terminal_run_gets_text_and_no_dialog(self):
         # A suite that pops a GUI alert on every run is a suite nobody runs.
         rc, err, alerted = self._run({"TERM": "xterm-256color"}, stderr_tty=True)
+        self.assertEqual(rc, 10)
+        self.assertIn("read-only", err)
+        self.assertFalse(alerted, "a terminal already shows the text")
+
+    def _bundle_launcher(self):
+        # The .app's own launcher carries the same guard, because a translocated
+        # bundle never reaches the shim in the home.
+        macos = os.path.join(self.paths.home_dir, "Game.app", "Contents", "MacOS")
+        os.makedirs(macos)
+        path = os.path.join(macos, "launch")
+        with open(path, "w") as f:
+            f.write(satoru.bundle_launch_text())
+        os.chmod(path, 0o755)
+        return path
+
+    def test_a_finder_launch_of_the_bundle_gets_the_alert(self):
+        rc, err, alerted = self._run({}, path=self._bundle_launcher())
+        self.assertEqual(rc, 10)
+        self.assertIn("read-only", err)
+        self.assertTrue(alerted, "a launch with no terminal must show the alert")
+
+    def test_a_terminal_run_of_the_bundle_gets_no_dialog(self):
+        rc, err, alerted = self._run({"TERM": "xterm-256color"}, stderr_tty=True,
+                                     path=self._bundle_launcher())
         self.assertEqual(rc, 10)
         self.assertIn("read-only", err)
         self.assertFalse(alerted, "a terminal already shows the text")

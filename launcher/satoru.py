@@ -12,14 +12,18 @@ do nothing; actions whose script is not on disk say "missing".
     python3 launcher/satoru.py --version  # what this build is, and which packs it knows
 """
 import contextlib
+import argparse
 import datetime
 import hashlib
 import os
 import platform
+import plistlib
 import re
 import shlex
 import shutil
+import struct
 import tarfile
+import tempfile
 import urllib.request
 import subprocess
 import sys
@@ -472,7 +476,7 @@ _SOURCE_KEYS = ("kind", "url", "sha256", "size", "version", "check")
 _REQUIRES_KEYS = ("arch", "macos", "rosetta", "disk_gb", "tools")
 _INSTALL_KEYS = ("home_authoritative", "foreign_note", "manual_url", "home")
 _COMMAND_KEYS = ("preflight", "install", "launch", "launch_plain", "uninstall", "update")
-_PATH_KEYS = ("profile", "logs")
+_PATH_KEYS = ("profile", "logs", "icon_exe")
 
 # What the packs ship today: one flat [game] table with the commands inside it.
 # All four are this shape, so it stays supported rather than being a migration.
@@ -493,6 +497,8 @@ def _blank_manifest():
                     "manual_url": "", "home": ""},
         "commands": dict((k, "") for k in _COMMAND_KEYS),
         "paths": dict((k, "") for k in _PATH_KEYS),
+        "modes": [],
+        "settings": [],
     }
 
 
@@ -549,7 +555,8 @@ def parse_manifest(data):
                 errors.append("unknown section [%s]" % name)
     else:
         for name in data:
-            if name not in _V1_SECTIONS and name != "contract":
+            if (name not in _V1_SECTIONS and name not in ("contract", "modes")
+                    and not name.startswith(SETTING_SECTION)):
                 errors.append("unknown section [%s]" % name)
         m["game"].update(_take(data.get("game", {}), _GAME_KEYS, errors, "[game]"))
         m["requires"].update(
@@ -563,6 +570,7 @@ def parse_manifest(data):
             src = dict((k, None) for k in _SOURCE_KEYS)
             src.update(_take(data["source"], _SOURCE_KEYS, errors, "[source]"))
             m["source"] = src
+        parse_modes(data, m, errors)
 
     # --- what has to be true whichever shape it came in ---
     gid = m["game"]["id"]
@@ -599,6 +607,228 @@ def parse_manifest(data):
                     errors.append("[source] %s is required for kind = \"release\"" % k)
 
     return m, errors
+
+
+# ----------------------------------------------------------------------------
+# launch modes: an optional part of contract 1 (docs/launch-modes-design.md)
+#
+# A pack may offer several ways to start the same game - offline, join a server,
+# host one - and the values each way needs. satoru asks, remembers, validates and
+# hands the answer over in the environment; the pack's own commands stay
+# non-interactive. A pack without [modes] never sees any of it.
+
+SETTING_SECTION = "setting_"
+SETTING_KINDS = ("text", "ipv4")
+_SETTING_KEYS = ("label", "modes", "kind", "pattern", "error")
+_MODE_ID_OK = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+_SETTING_NAME_OK = re.compile(r"^[a-z0-9][a-z0-9_]*$")
+LAUNCH_STATE_FILE = "satoru-launch.conf"
+CHANGE_SETTINGS_LABEL = "Change settings\u2026"
+
+
+def _one_line_text(value):
+    return isinstance(value, str) and value.strip() != "" and not any(
+        ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value)
+
+
+def parse_modes(data, m, errors):
+    """[modes] and [setting_<name>] into m["modes"] and m["settings"].
+
+    The reader keeps keys in the order they were written, so one table gives
+    both the list and its labels without the arrays of tables the subset refuses.
+    """
+    setting_sections = [n for n in data if n.startswith(SETTING_SECTION)]
+    modes = data.get("modes")
+    if modes is None:
+        for name in setting_sections:
+            errors.append("[%s] needs a [modes] section to belong to" % name)
+        return
+    if not isinstance(modes, dict) or not modes:
+        errors.append("[modes] must name at least one mode: id = \"label\"")
+        return
+    labels = set()
+    for mode_id, label in modes.items():
+        if not _MODE_ID_OK.match(mode_id):
+            errors.append("[modes] %r: a mode id is lower-case letters, digits, _ and -"
+                          % mode_id)
+            continue
+        if not _one_line_text(label):
+            errors.append("[modes] %s: the label must be a non-empty one-line string"
+                          % mode_id)
+            continue
+        if label in labels or label == CHANGE_SETTINGS_LABEL:
+            errors.append("[modes] %s: the label %r is used twice" % (mode_id, label))
+            continue
+        labels.add(label)
+        m["modes"].append({"id": mode_id, "label": label})
+    ids = [mode["id"] for mode in m["modes"]]
+
+    for section in setting_sections:
+        where = "[%s]" % section
+        name = section[len(SETTING_SECTION):]
+        if not _SETTING_NAME_OK.match(name):
+            errors.append("%s: a setting name is lower-case letters, digits and _" % where)
+            continue
+        if not isinstance(data[section], dict):
+            errors.append("%s must be a section" % where)
+            continue
+        setting = {"name": name, "label": "", "modes": [], "kind": "text",
+                   "pattern": "", "error": ""}
+        setting.update(_take(data[section], _SETTING_KEYS, errors, where))
+        ok = True
+        if not _one_line_text(setting["label"]):
+            errors.append("%s: label is required, one line" % where)
+            ok = False
+        wanted = setting["modes"]
+        if (not isinstance(wanted, list) or not wanted
+                or not all(isinstance(x, str) for x in wanted)):
+            errors.append("%s: modes must list the modes that need it" % where)
+            ok = False
+        else:
+            for mode_id in wanted:
+                if mode_id not in ids:
+                    errors.append("%s: modes names %r, which [modes] does not declare"
+                                  % (where, mode_id))
+                    ok = False
+        if setting["kind"] not in SETTING_KINDS:
+            errors.append("%s: kind %r must be one of %s"
+                          % (where, setting["kind"], ", ".join(SETTING_KINDS)))
+            ok = False
+        pattern = setting["pattern"]
+        if pattern:
+            # Checked twice, by Python here and by grep -E in the shim, so only
+            # what means the same to both is allowed: no escapes, no Python-only
+            # groups. A literal dot is [.], a digit is [0-9].
+            if not isinstance(pattern, str) or "\\" in pattern or "(?" in pattern \
+                    or "[:" in pattern or "[=" in pattern or "[." in pattern \
+                    or not _one_line_text(pattern):
+                errors.append("%s: pattern must be a one-line POSIX ERE without "
+                              "backslashes or [:class:] names" % where)
+                ok = False
+            else:
+                try:
+                    re.compile(pattern)
+                except re.error as exc:
+                    errors.append("%s: pattern does not compile: %s" % (where, exc))
+                    ok = False
+            if setting["kind"] != "text":
+                errors.append("%s: pattern only applies to kind = \"text\"" % where)
+                ok = False
+        if setting["error"] and not _one_line_text(setting["error"]):
+            errors.append("%s: error must be one line" % where)
+            ok = False
+        if ok:
+            m["settings"].append(setting)
+
+
+def mode_settings(manifest, mode_id):
+    return [s for s in manifest.get("settings") or [] if mode_id in s["modes"]]
+
+
+def valid_ipv4(value):
+    parts = value.split(".")
+    if len(parts) != 4:
+        return False
+    for part in parts:
+        if (not part or len(part) > 3 or not part.isdigit() or not part.isascii()
+                or int(part) > 255):
+            return False
+    return True
+
+
+def setting_problem(setting, value):
+    """None when the value is usable, otherwise what to tell the person.
+
+    The shim asks the same questions in shell; the pack asks them a third time,
+    because it can be run without satoru at all.
+    """
+    label = setting["label"]
+    custom = setting.get("error") or ""
+    if not value:
+        return custom or "%s is required" % label
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        return custom or "%s must be one line of text" % label
+    if setting["kind"] == "ipv4" and not valid_ipv4(value):
+        return custom or "%s must be an IPv4 address, like 192.168.0.10" % label
+    if setting.get("pattern") and not re.fullmatch(setting["pattern"], value):
+        return custom or "%s is not in the expected form" % label
+    return None
+
+
+def read_launch_state(home):
+    """{"mode": id or "", "settings": {name: value}}. Never raises."""
+    state = {"mode": "", "settings": {}}
+    try:
+        with open(os.path.join(home, LAUNCH_STATE_FILE), encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return state
+    for line in lines:
+        if line.lstrip().startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key, value = key.strip(" \t"), value.strip(" \t")
+        if key == "mode":
+            state["mode"] = value
+        elif key.startswith(SETTING_SECTION):
+            state["settings"][key[len(SETTING_SECTION):]] = value
+    return state
+
+
+def write_launch_state(home, mode_id, values):
+    """Atomically; key = value lines, the same shape the shim writes and reads."""
+    lines = ["mode = %s" % mode_id]
+    for name in sorted(values):
+        value = values[name]
+        if value and "\n" not in value and "\r" not in value:
+            lines.append("%s%s = %s" % (SETTING_SECTION, name, value))
+    path = os.path.join(home, LAUNCH_STATE_FILE)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    os.replace(tmp, path)
+
+
+def launch_mode_default(manifest, state):
+    ids = [mode["id"] for mode in manifest.get("modes") or []]
+    if not ids:
+        return ""
+    return state["mode"] if state["mode"] in ids else ids[0]
+
+
+def setting_env_name(name):
+    return "SATORU_SETTING_" + name.upper()
+
+
+def resolve_launch_mode(manifest, home, mode_id, ask, say, force=False):
+    """Fill in what `mode_id` needs, save the choice, return the environment.
+
+    `ask(setting, current)` returns the answer or None for "cancel"; `say(text)`
+    tells the person why an answer was refused. Values already saved and still
+    valid are not asked again unless `force`. Returns None when cancelled.
+    """
+    state = read_launch_state(home)
+    values = dict(state["settings"])
+    wanted = (manifest.get("settings") or []) if force else mode_settings(manifest, mode_id)
+    for setting in wanted:
+        value = values.get(setting["name"], "")
+        problem = setting_problem(setting, value)
+        asked = False
+        while force and not asked or problem:
+            if problem and asked:
+                say(problem)
+            answer = ask(setting, value)
+            asked = True
+            if answer is None:
+                return None
+            value = answer.strip(" \t")
+            problem = setting_problem(setting, value)
+        values[setting["name"]] = value
+    write_launch_state(home, mode_id, values)
+    env = {"SATORU_MODE": mode_id}
+    for setting in mode_settings(manifest, mode_id):
+        env[setting_env_name(setting["name"])] = values[setting["name"]]
+    return env
 
 
 # ----------------------------------------------------------------------------
@@ -674,6 +904,7 @@ class SystemProbe(object):
 TOOL_HINTS = {
     "ffmpeg": "brew install ffmpeg",
     "gh": "brew install gh",
+    "git-lfs": "brew install git-lfs",
     "dotnet": "install the .NET 8 SDK (arm64) from dotnet.microsoft.com",
     "python3": "xcode-select --install",
 }
@@ -1146,8 +1377,11 @@ def shim_text(paths, manifest, check_updates=True):
         add("  ) >/dev/null 2>&1 </dev/null &")
         add("fi")
         add("")
-    add('cd "$HERE" || exit 1')
     plain = (manifest["commands"] or {}).get("launch_plain") or ""
+    if manifest.get("modes"):
+        out.extend(_mode_shim_lines(manifest, launch, plain))
+        return "\n".join(out)
+    add('cd "$HERE" || exit 1')
     if plain and plain.split() != (launch + " --plain").split():
         # launch_plain names a command. Treating it as a flag - any value meaning
         # "run launch with --plain" - silently ran the wrong thing for a pack
@@ -1160,6 +1394,261 @@ def shim_text(paths, manifest, check_updates=True):
     add("exec sh -c %s satoru-launch \"$@\"" % shlex.quote(_launch_command_in_home(launch) + ' "$@"'))
     add("")
     return "\n".join(out)
+
+
+# The part of the shim a pack with [modes] gets. Static shell with the manifest's
+# data written into case statements: no python at launch time (a clean macOS may
+# not have one), and nothing the manifest says is ever evaluated as code. Every
+# string that reaches osascript goes in through argv, never into the script text.
+_MODE_SHIM = r"""# Launch modes (docs/launch-modes-design.md). SATORU_MODE set by the caller -
+# satoru's TUI, a script - means no dialog; otherwise the person is asked here,
+# which is what a double click on the bundle does.
+STATE="$HERE/@STATE@"
+GAME_NAME=@GAME_NAME@
+MODE_IDS=@MODE_IDS@
+ALL_SETTINGS=@ALL_SETTINGS@
+CHANGE=@CHANGE@
+PROMPT=@PROMPT@
+
+mode_label() {
+  case "$1" in
+@MODE_LABEL_CASES@
+  esac
+}
+mode_by_label() {
+  case "$1" in
+@MODE_BY_LABEL_CASES@
+  esac
+  return 1
+}
+mode_settings() {
+  case "$1" in
+@MODE_SETTINGS_CASES@
+  esac
+}
+setting_field() {
+  case "$1:$2" in
+@SETTING_FIELD_CASES@
+  esac
+}
+
+trim() {
+  v=$1
+  v=${v#"${v%%[![:space:]]*}"}
+  v=${v%"${v##*[![:space:]]}"}
+  printf '%s' "$v"
+}
+state_get() {
+  [ -f "$STATE" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in \#*) continue ;; *=*) ;; *) continue ;; esac
+    if [ "$(trim "${line%%=*}")" = "$1" ]; then
+      trim "${line#*=}"
+      return 0
+    fi
+  done < "$STATE"
+}
+state_save() {
+  tmp="$STATE.tmp.$$"
+  {
+    printf 'mode = %s\n' "$MODE"
+    for name in $ALL_SETTINGS; do
+      eval "value=\${VAL_$name:-}"
+      [ -z "$value" ] || printf 'setting_%s = %s\n' "$name" "$value"
+    done
+  } > "$tmp" 2>/dev/null && mv -f "$tmp" "$STATE" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+}
+valid_ipv4() {
+  rest=$1 count=0
+  case "$rest" in ''|*[!0-9.]*|.*|*.|*..*) return 1 ;; esac
+  while [ -n "$rest" ]; do
+    case "$rest" in
+      *.*) part=${rest%%.*}; rest=${rest#*.} ;;
+      *) part=$rest; rest= ;;
+    esac
+    [ "${#part}" -le 3 ] && [ "$part" -le 255 ] 2>/dev/null || return 1
+    count=$((count + 1))
+  done
+  [ "$count" = 4 ]
+}
+# Prints why a value is refused and returns 1; silent and 0 when it is usable.
+setting_problem() {
+  label=$(setting_field "$1" label)
+  custom=$(setting_field "$1" error)
+  if [ -z "$2" ]; then
+    printf '%s' "${custom:-$label is required}"; return 1
+  fi
+  case "$2" in *[[:cntrl:]]*)
+    printf '%s' "${custom:-$label must be one line of text}"; return 1 ;;
+  esac
+  if [ "$(setting_field "$1" kind)" = ipv4 ] && ! valid_ipv4 "$2"; then
+    printf '%s' "${custom:-$label must be an IPv4 address, like 192.168.0.10}"; return 1
+  fi
+  pattern=$(setting_field "$1" pattern)
+  if [ -n "$pattern" ] && ! printf '%s\n' "$2" | /usr/bin/grep -Eqx -- "$pattern"; then
+    printf '%s' "${custom:-$label is not in the expected form}"; return 1
+  fi
+  return 0
+}
+
+osa_choose() {
+  osascript -e 'on run argv' -e 'activate' \
+    -e 'set r to choose from list (items 5 thru -1 of argv) with title (item 3 of argv) with prompt (item 4 of argv) default items {item 2 of argv} OK button name "Play" cancel button name "Cancel"' \
+    -e 'if r is false then return "cancel:"' -e 'return "ok:" & (item 1 of r)' \
+    -e 'end run' satoru "$@" 2>/dev/null
+}
+osa_ask() {
+  osascript -e 'on run argv' -e 'activate' -e 'try' \
+    -e 'set r to display dialog (item 4 of argv) default answer (item 2 of argv) with title (item 3 of argv) buttons {"Cancel", "OK"} default button "OK" cancel button "Cancel"' \
+    -e 'return "ok:" & (text returned of r)' -e 'on error number -128' -e 'return "cancel:"' -e 'end try' \
+    -e 'end run' satoru "$@" 2>/dev/null
+}
+osa_alert() {
+  osascript -e 'on run argv' -e 'activate' \
+    -e 'display alert (item 2 of argv) message (item 3 of argv) as critical' \
+    -e 'end run' satoru "$@" >/dev/null 2>&1 || true
+}
+no_dialog() {
+  printf '%s\n' "$GAME_NAME could not show its launch dialog." \
+    "Choose a mode in satoru, or set SATORU_MODE to one of: $MODE_IDS" >&2
+  exit 10
+}
+
+# ask_settings FORCE NAME... : ask for each value that is missing or refused (all
+# of them when FORCE is 1). Returns 20 when the person cancels.
+ask_settings() {
+  force=$1; shift
+  for name in "$@"; do
+    eval "value=\${VAL_$name:-}"
+    asked=0
+    while :; do
+      problem=$(setting_problem "$name" "$value") && [ "$force$asked" != 10 ] && break
+      [ "$asked" = 0 ] || [ -z "$problem" ] || osa_alert "$GAME_NAME" "$problem"
+      answer=$(osa_ask "$value" "$GAME_NAME" "$(setting_field "$name" label)") || no_dialog
+      case "$answer" in
+        cancel:*) return 20 ;;
+        ok:*) value=$(trim "${answer#ok:}") ;;
+        *) no_dialog ;;
+      esac
+      asked=1
+    done
+    eval "VAL_$name=\$value"
+  done
+  return 0
+}
+
+load_state() {
+  for name in $ALL_SETTINGS; do
+    eval "VAL_$name=\$(state_get setting_$name)"
+  done
+}
+load_state
+
+if [ -n "${SATORU_MODE:-}" ]; then
+  MODE=$SATORU_MODE
+  case " $MODE_IDS " in *" $MODE "*) ;; *)
+    printf '%s\n' "SATORU_MODE=$MODE is not a mode of $GAME_NAME: use one of $MODE_IDS" >&2
+    exit 10 ;;
+  esac
+  for name in $(mode_settings "$MODE"); do
+    eval "given=\${SATORU_SETTING_$(printf '%s' "$name" | tr a-z A-Z):-}"
+    [ -z "$given" ] || eval "VAL_$name=\$given"
+    eval "value=\${VAL_$name:-}"
+    if ! problem=$(setting_problem "$name" "$value"); then
+      printf '%s\n' "$problem" \
+        "Set SATORU_SETTING_$(printf '%s' "$name" | tr a-z A-Z), or choose in satoru." >&2
+      exit 10
+    fi
+  done
+else
+  command -v osascript >/dev/null 2>&1 || no_dialog
+  MODE=$(state_get mode)
+  case " $MODE_IDS " in *" $MODE "*) [ -n "$MODE" ] ;; *) false ;; esac || MODE=${MODE_IDS%% *}
+  while :; do
+    answer=$(osa_choose "$(mode_label "$MODE")" "$GAME_NAME" "$PROMPT" @CHOOSE_ITEMS@) || no_dialog
+    case "$answer" in
+      cancel:*) exit 20 ;;
+      ok:*) picked=${answer#ok:} ;;
+      *) no_dialog ;;
+    esac
+    if [ "$picked" = "$CHANGE" ]; then
+      # Cancelling a change goes back to the list with nothing changed.
+      if ask_settings 1 $ALL_SETTINGS; then state_save; else load_state; fi
+      continue
+    fi
+    MODE=$(mode_by_label "$picked") || no_dialog
+    ask_settings 0 $(mode_settings "$MODE") || exit 20
+    break
+  done
+fi
+
+state_save
+export SATORU_MODE="$MODE"
+for name in $(mode_settings "$MODE"); do
+  eval "export SATORU_SETTING_$(printf '%s' "$name" | tr a-z A-Z)=\"\$VAL_$name\""
+done
+
+cd "$HERE" || exit 1
+@PICK_COMMAND@
+# Not `[ -z "$TERM" ]`: /bin/sh sets TERM=dumb when it is unset, so under Finder
+# that test is never true. No terminal on stderr and no real TERM is a double click.
+if [ ! -t 2 ] && [ "${TERM:-dumb}" = dumb ]; then
+  # A double click gives the game no terminal, so a refusal written to stderr -
+  # a bad address, a missing file - would reach nobody. Keep it and show it.
+  ERR=$(mktemp -t satoru-launch 2>/dev/null) || ERR=/dev/null
+  sh -c "$COMMAND" satoru-launch "$@" 2>"$ERR"
+  rc=$?
+  if [ "$rc" != 0 ] && [ "$rc" != 20 ] && [ "$ERR" != /dev/null ]; then
+    osa_alert "$GAME_NAME" "$(tail -n 8 "$ERR")"
+  fi
+  [ "$ERR" = /dev/null ] || { cat "$ERR" >&2; rm -f "$ERR"; }
+  exit "$rc"
+fi
+exec sh -c "$COMMAND" satoru-launch "$@"
+"""
+
+
+def _mode_shim_lines(manifest, launch, plain):
+    q = shlex.quote
+    modes = [m for m in manifest["modes"] if _MODE_ID_OK.match(m["id"])]
+    settings = [s for s in manifest.get("settings") or []
+                if _SETTING_NAME_OK.match(s["name"])]
+    ids = [m["id"] for m in modes]
+    items = [m["label"] for m in modes] + ([CHANGE_SETTINGS_LABEL] if settings else [])
+    fields = []
+    for s in settings:
+        for field in ("label", "kind", "pattern", "error"):
+            if s.get(field):
+                fields.append("    %s) printf '%%s' %s ;;" % (q(s["name"] + ":" + field),
+                                                             q(str(s[field]))))
+    run = _launch_command_in_home(launch) + ' "$@"'
+    if plain and plain.split() != (launch + " --plain").split():
+        pick = ('if [ "${1:-}" = "--plain" ]; then\n  shift\n  COMMAND=%s\nelse\n'
+                '  COMMAND=%s\nfi' % (q(_launch_command_in_home(plain) + ' "$@"'), q(run)))
+    else:
+        pick = "COMMAND=%s" % q(run)
+    values = {
+        "@STATE@": LAUNCH_STATE_FILE,
+        "@GAME_NAME@": q(manifest["game"]["name"]),
+        "@MODE_IDS@": q(" ".join(ids)),
+        "@ALL_SETTINGS@": q(" ".join(s["name"] for s in settings)),
+        "@CHANGE@": q(CHANGE_SETTINGS_LABEL),
+        "@PROMPT@": q("How do you want to play %s?" % manifest["game"]["name"]),
+        "@MODE_LABEL_CASES@": "\n".join(
+            "    %s) printf '%%s' %s ;;" % (m["id"], q(m["label"])) for m in modes),
+        "@MODE_BY_LABEL_CASES@": "\n".join(
+            "    %s) printf '%%s' %s; return 0 ;;" % (q(m["label"]), m["id"]) for m in modes),
+        "@MODE_SETTINGS_CASES@": "\n".join(
+            "    %s) printf '%%s' %s ;;" % (m["id"], q(" ".join(
+                s["name"] for s in settings if m["id"] in s["modes"])))
+            for m in modes),
+        "@SETTING_FIELD_CASES@": "\n".join(fields) or "    *) ;;",
+        "@CHOOSE_ITEMS@": " ".join(q(i) for i in items),
+        "@PICK_COMMAND@": pick,
+    }
+    # One pass, so a label that happens to contain @SOMETHING@ is left alone.
+    text = re.sub(r"@[A-Z_]+@", lambda m: values.get(m.group(0), m.group(0)), _MODE_SHIM)
+    return text.split("\n")
 
 
 def newer_version(paths, game_id):
@@ -1195,6 +1684,349 @@ def write_shim(paths, manifest, write=True, check_updates=True):
         fh.write(text)
     os.chmod(path, 0o755)
     return path
+
+
+def bundle_info(manifest, icon_filename=None):
+    """Keys Finder, Spotlight and TCC read. One identifier per game, so a
+    microphone prompt is attributed to the game and not to Terminal."""
+    game = manifest["game"]
+    name, gid = game["name"], game["id"]
+    version = str(((manifest.get("source") or {}).get("version")) or "0")
+    if version.startswith("v"):
+        version = version[1:]
+    why = "%s needs this to play." % name
+    info = {
+        "CFBundleDevelopmentRegion": "en",
+        "CFBundleDisplayName": name,
+        "CFBundleExecutable": "launch",
+        "CFBundleIdentifier": "org.satoru.game." + gid,
+        "CFBundleInfoDictionaryVersion": "6.0",
+        "CFBundleName": name,
+        "CFBundlePackageType": "APPL",
+        "CFBundleShortVersionString": version,
+        "CFBundleSignature": "????",
+        "CFBundleVersion": "1",
+        "NSHighResolutionCapable": True,
+        "NSCameraUsageDescription": why,
+        "NSMicrophoneUsageDescription": why,
+        "NSLocalNetworkUsageDescription": why,
+    }
+    if icon_filename:
+        info["CFBundleIconFile"] = icon_filename
+    minimum = (manifest.get("requires") or {}).get("macos") or ""
+    match = re.fullmatch(r"\s*>=\s*(\d+(?:\.\d+)*)\s*", minimum)
+    if match:
+        value = match.group(1)
+        info["LSMinimumSystemVersion"] = value if "." in value else value + ".0"
+    return info
+
+
+def bundle_launch_text(exec_path=None, cwd=None, extra_args=None):
+    """Contents/MacOS/launch. The .app calls this and nothing else.
+
+    Production (exec_path is None) hands off to the shim in the home, so an
+    update rewrites the shim and leaves the bundle — and Spotlight's icon —
+    untouched. A thin wrap (exec_path set) is for try-dev: an existing
+    launcher stays where it is.
+    """
+    out = []
+    add = out.append
+    add("#!/bin/sh")
+    add("# satoru bundle launcher. Generated by satoru - edits are lost on update.")
+    add('HERE=$(cd "$(dirname "$0")" && pwd -P)')
+    add("")
+    add('case "$0$HERE" in')
+    add("  */AppTranslocation/*)")
+    add('    msg="macOS started this game from a read-only copy, so nothing it saves would be kept."')
+    add('    fix="Move the app into Applications in Finder - one at a time, not several at once - then open it again."')
+    add('    printf \'%s\\n%s\\n\' "$msg" "$fix" >&2')
+    add('    # /bin/sh sets TERM=dumb when it is unset, so an empty-TERM test never')
+    add("    # sees Finder. No terminal on stderr and no real TERM is a double click.")
+    add('    if [ ! -t 2 ] && [ "${TERM:-dumb}" = dumb ]; then')
+    add('      osascript -e "display alert \\"$msg\\" message \\"$fix\\"" >/dev/null 2>&1 || true')
+    add("    fi")
+    add("    exit 10")
+    add("    ;;")
+    add("esac")
+    add("")
+    if exec_path:
+        if cwd:
+            add("cd %s || exit 1" % shlex.quote(cwd))
+        parts = [shlex.quote(exec_path)]
+        for arg in extra_args or []:
+            parts.append(shlex.quote(arg))
+        add("exec %s \"$@\"" % " ".join(parts))
+    else:
+        add('exec "$HERE/../Resources/home/launch" "$@"')
+    add("")
+    return "\n".join(out)
+
+
+# ----------------------------------------------------------------------------
+# the bundle's icon
+#
+# Two sources, tried in order, and neither is allowed to fail the install:
+# the game's own exe, when a pack names one (`[paths] icon_exe`), and
+# otherwise a mark this project drew for itself
+# (launcher/assets/satoru-default.icns). A pack is not required to name an
+# exe; every bundle still gets an icon rather than Finder's generic one.
+
+RT_ICON = 3
+RT_GROUP_ICON = 14
+DEFAULT_ICON_ASSET = os.path.join(ROOT, "launcher", "assets", "satoru-default.icns")
+
+
+def _read_struct(fh, fmt, offset):
+    fh.seek(offset)
+    size = struct.calcsize(fmt)
+    data = fh.read(size)
+    if len(data) != size:
+        raise ValueError("truncated at offset %d reading %r" % (offset, fmt))
+    return struct.unpack(fmt, data)
+
+
+def _pe_sections(fh):
+    """(sections, resource_dir_rva). sections is [(va, size_of_raw, ptr_to_raw), ...].
+
+    Reads only what it needs — DOS header, PE + optional header, the section
+    table — never the whole file: a game's own exe can be very large, and
+    everything this cares about lives in the first few kilobytes.
+    """
+    fh.seek(0)
+    if fh.read(2) != b"MZ":
+        raise ValueError("not a PE file (no MZ signature)")
+    (e_lfanew,) = _read_struct(fh, "<I", 0x3C)
+    fh.seek(e_lfanew)
+    if fh.read(4) != b"PE\0\0":
+        raise ValueError("no PE header at e_lfanew")
+    file_header_off = e_lfanew + 4
+    _, num_sections = _read_struct(fh, "<HH", file_header_off)
+    (size_opt,) = _read_struct(fh, "<H", file_header_off + 16)
+    opt_off = file_header_off + 20
+    (magic,) = _read_struct(fh, "<H", opt_off)
+    if magic == 0x10B:      # PE32
+        dd_off = opt_off + 96
+    elif magic == 0x20B:    # PE32+
+        dd_off = opt_off + 112
+    else:
+        raise ValueError("unknown optional header magic 0x%x" % magic)
+    rsrc_rva, rsrc_size = _read_struct(fh, "<II", dd_off + 2 * 8)
+    if not rsrc_rva or not rsrc_size:
+        raise ValueError("this exe has no resource directory")
+    sec_off = opt_off + size_opt
+    sections = []
+    for i in range(num_sections):
+        _, vsize, va, sraw, praw = _read_struct(fh, "<8sIIII", sec_off + i * 40)
+        sections.append((va, sraw, praw))
+    return sections, rsrc_rva
+
+
+def _rva_to_offset(sections, rva):
+    for va, sraw, praw in sections:
+        if va <= rva < va + sraw:
+            return praw + (rva - va)
+    raise ValueError("rva 0x%x is outside every section" % rva)
+
+
+def _read_resource_dir(fh, sections, dir_rva):
+    off = _rva_to_offset(sections, dir_rva)
+    _, _, _, _, named, idc = _read_struct(fh, "<IIHHHH", off)
+    fh.seek(off + 16)
+    entries = []
+    for _ in range(named + idc):
+        id_or_name, offset_to_data = struct.unpack("<II", fh.read(8))
+        entries.append((id_or_name, offset_to_data))
+    return entries
+
+
+def _find_id(entries, wanted_id):
+    for id_or_name, offset in entries:
+        if not (id_or_name & 0x80000000) and id_or_name == wanted_id:
+            return offset
+    return None
+
+
+def _resource_data(fh, sections, rsrc_rva, dir_offset):
+    """Follow a Type-level offset (a subdirectory) down through the one
+    name and the one language it has, to the raw bytes of the resource."""
+    names = _read_resource_dir(fh, sections, rsrc_rva + (dir_offset & 0x7FFFFFFF))
+    if not names:
+        return None
+    _, lang_off = names[0]
+    if lang_off & 0x80000000:
+        langs = _read_resource_dir(fh, sections, rsrc_rva + (lang_off & 0x7FFFFFFF))
+        if not langs:
+            return None
+        _, data_off = langs[0]
+    else:
+        data_off = lang_off
+    data_entry_off = _rva_to_offset(sections, rsrc_rva + data_off)
+    rva, size, _cp, _res = _read_struct(fh, "<IIII", data_entry_off)
+    fh.seek(_rva_to_offset(sections, rva))
+    return fh.read(size)
+
+
+def pe_best_icon_ico(exe_path):
+    """The exe's own icon, repacked as a single-image .ico, or None.
+
+    A Windows exe carries a whole family of sizes under RT_GROUP_ICON /
+    RT_ICON. Only the largest (by area, then by bit depth) is kept: it is
+    the one `sips` actually uses when given an .ico with several images,
+    so shipping the rest would only make the file bigger, not the result
+    better. Any malformed input — not a PE, no resources, a truncated
+    section — is a None, never an exception: the caller falls back.
+    """
+    try:
+        with open(exe_path, "rb") as fh:
+            sections, rsrc_rva = _pe_sections(fh)
+            root = _read_resource_dir(fh, sections, rsrc_rva)
+            group_type_off = _find_id(root, RT_GROUP_ICON)
+            icon_type_off = _find_id(root, RT_ICON)
+            if group_type_off is None or icon_type_off is None:
+                return None
+            group_bytes = _resource_data(fh, sections, rsrc_rva, group_type_off)
+            if not group_bytes:
+                return None
+            icon_names = _read_resource_dir(
+                fh, sections, rsrc_rva + (icon_type_off & 0x7FFFFFFF))
+
+            _, _, count = struct.unpack_from("<HHH", group_bytes, 0)
+            best = None
+            for i in range(count):
+                (bw, bh, colors, _res, planes, bitcount, byte_count, icon_id
+                 ) = struct.unpack_from("<BBBBHHIH", group_bytes, 6 + i * 14)
+                width, height = (bw or 256), (bh or 256)
+                score = (width * height, bitcount)
+                if best is not None and score <= best[0]:
+                    continue
+                icon_data_off = _find_id(icon_names, icon_id)
+                if icon_data_off is None:
+                    continue
+                img = _resource_data(fh, sections, rsrc_rva, icon_data_off)
+                if not img:
+                    continue
+                best = (score, bw, bh, colors, planes, bitcount, img)
+            if best is None:
+                return None
+            _, bw, bh, colors, planes, bitcount, img = best
+            header = struct.pack("<HHH", 0, 1, 1)
+            entry = struct.pack("<BBBBHHII", bw, bh, colors, 0, planes, bitcount,
+                                 len(img), 6 + 16)
+            return header + entry + img
+    except (OSError, ValueError, struct.error, IndexError):
+        return None
+
+
+def _icon_source_path(paths, manifest):
+    """Where the manifest's own `[paths] icon_exe` points, resolved against
+    the game's home - or None when the key is absent, or when it would step
+    outside that home. The manifest arrives off the internet; `..` and an
+    absolute path are refused the same way a bad game id already is."""
+    rel = ((manifest.get("paths") or {}).get("icon_exe") or "").strip()
+    if not rel:
+        return None
+    if os.path.isabs(rel) or rel.startswith("~"):
+        return None
+    home = os.path.abspath(paths.home(manifest["game"]["name"]))
+    candidate = os.path.abspath(os.path.join(home, rel))
+    if candidate != home and not candidate.startswith(home + os.sep):
+        return None
+    return candidate
+
+
+def _sips_to_icns(src_path, dest_path):
+    """The one external tool the icon feature needs. Any way it can fail —
+    the binary missing, an image it cannot read, a full disk — is the
+    caller's cue to fall back, not an exception to propagate."""
+    try:
+        with open(os.devnull, "wb") as null:
+            code = subprocess.call(
+                ["sips", "-s", "format", "icns", src_path, "--out", dest_path],
+                stdout=null, stderr=null)
+    except OSError:
+        return False
+    return code == 0 and os.path.isfile(dest_path) and os.path.getsize(dest_path) > 0
+
+
+def install_bundle_icon(paths, manifest, resources_dir, convert=_sips_to_icns):
+    """Best effort, in this order: the game's own icon, the icon already
+    sitting there from a previous install, satoru's own mark. Returns the
+    filename (relative to Contents/Resources) for CFBundleIconFile, or None
+    when even the fallback asset is missing. Never raises: a bundle must
+    still be written when every part of this fails.
+    """
+    try:
+        icns_name = "%s.icns" % Paths._checked(manifest["game"]["id"])
+    except Exception:
+        # A game id this broken never gets this far in practice - install_game
+        # rejects it long before a bundle is written - but this function's own
+        # promise is to never raise, so a filename that is not safe to use
+        # means no icon rather than a write outside Contents/Resources.
+        return None
+    dest = os.path.join(resources_dir, icns_name)
+    try:
+        exe = _icon_source_path(paths, manifest)
+        if exe and os.path.isfile(exe):
+            ico_bytes = pe_best_icon_ico(exe)
+            if ico_bytes:
+                tmp_fd, tmp_path = tempfile.mkstemp(suffix=".ico")
+                try:
+                    with os.fdopen(tmp_fd, "wb") as fh:
+                        fh.write(ico_bytes)
+                    if convert(tmp_path, dest):
+                        return icns_name
+                finally:
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+        # Extraction unavailable or failed this time: an icon a previous,
+        # successful install already left behind is still better than
+        # downgrading a working bundle to the generic mark.
+        if os.path.isfile(dest):
+            return icns_name
+    except Exception:
+        pass
+    try:
+        if os.path.isfile(DEFAULT_ICON_ASSET):
+            shutil.copyfile(DEFAULT_ICON_ASSET, dest)
+            return icns_name
+    except Exception:
+        pass
+    return None
+
+
+def write_bundle(paths, manifest, exec_path=None, cwd=None, extra_args=None,
+                  icon_convert=None):
+    """Create or refresh the .app. Returns its path. Idempotent: a second
+    Install updates the plist and launcher in place, it does not grow a twin."""
+    name = manifest["game"]["name"]
+    bundle = paths.bundle(name)
+    macos = os.path.join(bundle, "Contents", "MacOS")
+    resources = os.path.join(bundle, "Contents", "Resources")
+    if not os.path.isdir(macos):
+        os.makedirs(macos)
+    if not os.path.isdir(resources):
+        os.makedirs(resources)
+    if icon_convert is not None:
+        icon_filename = install_bundle_icon(paths, manifest, resources,
+                                             convert=icon_convert)
+    else:
+        icon_filename = install_bundle_icon(paths, manifest, resources)
+    with open(os.path.join(bundle, "Contents", "Info.plist"), "wb") as fh:
+        plistlib.dump(bundle_info(manifest, icon_filename=icon_filename), fh)
+    launch = os.path.join(macos, "launch")
+    with open(launch, "w", encoding="utf-8") as fh:
+        fh.write(bundle_launch_text(
+            exec_path=exec_path, cwd=cwd, extra_args=extra_args))
+    os.chmod(launch, 0o755)
+    # Finder caches an app's icon on the bundle itself; touch it so a changed
+    # icon is picked up instead of the one it saw the last time it looked.
+    try:
+        os.utime(bundle, None)
+    except OSError:
+        pass
+    return bundle
 
 
 # ----------------------------------------------------------------------------
@@ -1260,6 +2092,8 @@ def explain_exit(code, command, output=None):
     """
     said = [line for line in (output or []) if line and line.strip()]
     tail = said[-1].strip() if said else ""
+    if code == 10 and said:
+        return _EXIT_REASON[code], CONTRACT_EXITS[code] + ":\n" + "\n".join(output)
     if code in CONTRACT_EXITS:
         message = CONTRACT_EXITS[code]
         return _EXIT_REASON[code], (message + ": " + tail) if tail else message
@@ -1415,6 +2249,9 @@ def install_game(manifest, paths, probe=None, runner=None, fetch=None, unpack=No
     # volume - leaves the state file saying installed while the launcher looks for
     # a launch script that is not there and says the opposite.
     write_shim(paths, manifest, check_updates=check_updates)
+    # The shim is the game; the bundle is how Finder finds it. Written before
+    # installed.toml so a claim of "installed" is never a broken icon.
+    write_bundle(paths, manifest)
     entry = record_install(paths, manifest, (source or {}).get("sha256"))
     if nothing_to_do:
         return _install_result(True, "done", reason="nothing-to-do",
@@ -1590,12 +2427,45 @@ class Game(object):
             errs.append("status %s but no launch command" % self.status)
         return errs
 
+    def actions(self):
+        """ACTIONS, with Launch replaced by one entry per launch mode, if any."""
+        modes = self.manifest.get("modes") or []
+        if not modes or self.contract < 1:
+            return ACTIONS
+        out = [ACTIONS[0]]
+        for mode in modes:
+            out.append(("mode:" + mode["id"], "Launch: " + mode["label"], "cmd"))
+        if self.manifest.get("settings"):
+            out.append(("settings", CHANGE_SETTINGS_LABEL, "cmd"))
+        out.extend(ACTIONS[2:])
+        return out
+
+    def game_home(self, paths=None):
+        paths = paths or Paths()
+        entry = installed_entry(paths, self.id)
+        return (entry or {}).get("home") or paths.home(self.name)
+
+    def last_mode(self, paths=None):
+        """The mode the person chose last time, or the first one."""
+        return launch_mode_default(self.manifest, read_launch_state(self.game_home(paths)))
+
     def installed_home(self, paths=None):
         """Where this game would be, once installed. Only meaningful for v1."""
         return (paths or Paths()).home(self.name)
 
     def action_state(self, key, paths=None):
         """(state, detail): state is 'ok' | 'soon' | 'missing'."""
+        if key.startswith("mode:") or key == "settings":
+            state, detail = self.action_state("launch", paths)
+            if state != "ok":
+                return state, detail
+            if key == "settings":
+                return "ok", ", ".join(s["label"] for s in self.manifest["settings"])
+            mode_id = key[len("mode:"):]
+            names = [s["label"] for s in mode_settings(self.manifest, mode_id)]
+            last = " (last)" if mode_id == self.last_mode(paths) else ""
+            return "ok", "SATORU_MODE=%s%s%s" % (
+                mode_id, " + " + ", ".join(names) if names else "", last)
         if self.status == "wip":
             return "soon", ""
         if self.contract >= 1:
@@ -1696,11 +2566,8 @@ def _install_via_umbrella(game, paths):
     result = install_game(game.manifest, paths, on_output=echo,
                           check_updates=load_config(paths.config_file)["check_updates"])
     if result["ok"]:
-        # Not "it is in Spotlight now": nothing here writes Info.plist yet, so
-        # what is on disk is a directory named .app that Finder shows as broken.
-        # Say where it went and offer the action that does work.
-        return 0, "%s installed into %s. Launch it from here; the Finder icon " \
-                  "comes with the bundle work." % (game.name, paths.bundle(game.name))
+        return 0, "%s installed into %s. Spotlight and Launchpad can open it." % (
+            game.name, paths.bundle(game.name))
     if result["step"] == "requirements":
         unmet = [r for r in result["requirements"] if not r["ok"]]
         lines = []
@@ -1716,6 +2583,45 @@ def _install_via_umbrella(game, paths):
     return 1, "%s failed at %s: %s" % (game.name, result["step"], result["message"])
 
 
+def _terminal_ask(setting, current):
+    """Enter keeps the current value. EOF or Ctrl-C is "cancel"."""
+    prompt = "%s [%s]: " % (setting["label"], current) if current else "%s: " % setting["label"]
+    try:
+        answer = input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        sys.stdout.write("\n")
+        return None
+    return answer if answer.strip() else current
+
+
+def _terminal_say(text):
+    sys.stdout.write("  %s\n" % text)
+    sys.stdout.flush()
+
+
+def launch_with_mode(game, paths, key, ask=None, say=None, call=None):
+    """TUI side of launch modes: ask here, in the terminal, then run the shim with
+    SATORU_MODE set so that it shows no dialog of its own. Returns (rc, message)."""
+    ask, say = ask or _terminal_ask, say or _terminal_say
+    call = call or subprocess.call
+    home = game.game_home(paths)
+    last = game.last_mode(paths)
+    if key == "settings":
+        env = resolve_launch_mode(game.manifest, home, last, ask, say, force=True)
+        if env is None:
+            return 20, "settings unchanged."
+        return 0, "settings saved for %s." % game.name
+    mode_id = key[len("mode:"):] if key.startswith("mode:") else last
+    env = resolve_launch_mode(game.manifest, home, mode_id, ask, say)
+    if env is None:
+        return 20, "cancelled; %s was not started." % game.name
+    full = dict(os.environ)
+    full.update(env)
+    args = ["--plain"] if key == "launch_plain" else []
+    rc = call([os.path.join(home, "launch")] + args, env=full)
+    return rc, "%s (%s) exited with %d." % (key, mode_id, rc)
+
+
 def run_action(game, key):
     """Returns (returncode, message). Called with the terminal in normal mode."""
     paths = current_paths()
@@ -1727,14 +2633,19 @@ def run_action(game, key):
                 game.name, game.manual_url)
         return 0, "%s: SOON — not available for %s yet." % (key, game.name)
     if state == "missing":
-        if game.contract >= 1 and key in ("launch", "launch_plain"):
+        if game.contract >= 1 and (key in ("launch", "launch_plain", "settings")
+                                   or key.startswith("mode:")):
             return 1, "%s is not installed yet - run Setup first." % game.name
         return 1, "%s: missing %s (submodule not checked out?)" % (key, detail)
     if game.contract >= 1 and key == "setup":
         return _install_via_umbrella(game, paths)
+    if game.contract >= 1 and game.manifest.get("modes") and (
+            key in ("launch", "launch_plain", "settings") or key.startswith("mode:")):
+        return launch_with_mode(game, paths, key)
     if game.contract >= 1 and key in ("launch", "launch_plain"):
         args = ["--plain"] if key == "launch_plain" else []
-        shim = os.path.join(paths.home(game.name), "launch")
+        entry = installed_entry(paths, game.id)
+        shim = os.path.join((entry or {}).get("home") or paths.home(game.name), "launch")
         rc = subprocess.call([shim] + args)
         return rc, "%s exited with %d." % (key, rc)
     kind = dict((k, kind) for k, _, kind in ACTIONS)[key]
@@ -1768,11 +2679,11 @@ def run_action(game, key):
 # ----------------------------------------------------------------------------
 # plain mode
 
-def describe(games, out=sys.stdout, paths=None):
+def describe(games, out=sys.stdout, paths=None, games_dir=GAMES_DIR):
     if not games:
-        out.write(NO_GAMES_HINT % GAMES_DIR)
+        out.write(NO_GAMES_HINT % games_dir)
         return
-    absent = unchecked_packs()
+    absent = unchecked_packs(games_dir)
     if absent:
         out.write("Not listed: %s — submodule%s not checked out.\n"
                   "Run `git submodule update --init --recursive`, or take the release\n"
@@ -1786,7 +2697,7 @@ def describe(games, out=sys.stdout, paths=None):
         newer = newer_version(paths or current_paths(), g.id)
         if newer:
             out.write("    %-32s %s\n" % ("Update available", newer))
-        for key, label, _ in ACTIONS:
+        for key, label, _ in g.actions():
             state, detail = g.action_state(key)
             if state == "ok":
                 out.write("    %-32s %s\n" % (label, detail))
@@ -1892,7 +2803,7 @@ def tui(stdscr, games):
             g = games[sel]
             put(y, 1, "Actions — %s" % g.name, curses.A_BOLD)
             y += 1
-            for i, (key, label, _) in enumerate(ACTIONS):
+            for i, (key, label, _) in enumerate(g.actions()):
                 state, detail = g.action_state(key)
                 cur = (mode == "actions" and i == action_sel)
                 attr = curses.A_REVERSE if cur else 0
@@ -1943,18 +2854,24 @@ def tui(stdscr, games):
             elif ch in (curses.KEY_ENTER, 10, 13, curses.KEY_RIGHT, ord("l")) and games:
                 mode = "actions"
                 action_sel = 0
+                g = games[sel]
+                if g.manifest.get("modes") and g.contract >= 1:
+                    # The last choice is where the cursor starts, as in the dialog.
+                    keys = [k for k, _, _ in g.actions()]
+                    last = "mode:" + g.last_mode()
+                    action_sel = keys.index(last) if last in keys else 0
                 message = ""
         else:
             if ch in (curses.KEY_DOWN, ord("j")):
-                action_sel = (action_sel + 1) % len(ACTIONS)
+                action_sel = (action_sel + 1) % len(games[sel].actions())
             elif ch in (curses.KEY_UP, ord("k")):
-                action_sel = (action_sel - 1) % len(ACTIONS)
+                action_sel = (action_sel - 1) % len(games[sel].actions())
             elif ch in (27, curses.KEY_LEFT, ord("h")):
                 mode = "games"
                 message = ""
             elif ch in (curses.KEY_ENTER, 10, 13):
                 g = games[sel]
-                key = ACTIONS[action_sel][0]
+                key = g.actions()[action_sel][0]
                 state, _ = g.action_state(key)
                 if state != "ok":
                     _, message = run_action(g, key)
@@ -1974,21 +2891,45 @@ def tui(stdscr, games):
 
 
 def main(argv=None):
-    argv = list(sys.argv[1:] if argv is None else argv)
-    if "--version" in argv:
+    parser = argparse.ArgumentParser(description="Install and launch satoru game packs.")
+    parser.add_argument("--games-dir", default=GAMES_DIR, help="game manifest catalogue")
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("--version", action="store_true")
+    action.add_argument("--check", action="store_true")
+    action.add_argument("--list", action="store_true")
+    action.add_argument("--install", metavar="GAME")
+    action.add_argument("--launch", metavar="GAME")
+    action.add_argument("--launch-plain", metavar="GAME")
+    options = parser.parse_args(argv)
+    games = load_games(options.games_dir)
+    if options.version:
         sys.stdout.write("satoru %s\n" % version())
-        for g in load_games():
+        for g in games:
             sys.stdout.write("  %-12s %s\n" % (g.id, STATUS_LABEL.get(g.status, g.status)))
         return 0
-    if "--check" in argv:
-        return 0 if check() else 1
-    games = load_games()
-    if "--list" in argv:
-        describe(games)
+    if options.check:
+        return 0 if check(options.games_dir, out=sys.stdout) else 1
+    if options.list:
+        describe(games, out=sys.stdout, games_dir=options.games_dir)
         return 0
-    if argv and argv[0] not in ("--list", "--check", "--version"):
-        sys.stderr.write(__doc__)
-        return 2
+    for game_id, key in ((options.install, "setup"), (options.launch, "launch"),
+                         (options.launch_plain, "launch_plain")):
+        if game_id is not None:
+            game = next((g for g in games if g.id == game_id), None)
+            if game is None:
+                sys.stderr.write("Unknown game %r. Available: %s\n" % (
+                    game_id, ", ".join(g.id for g in games)))
+                return 2
+            if game.validate():
+                sys.stderr.write("Invalid manifest: %s\n" % "; ".join(game.validate()))
+                return 2
+            state, detail = game.action_state(key, current_paths())
+            if state != "ok":
+                sys.stderr.write("%s: %s\n" % (game_id, detail or "action unavailable"))
+                return 1
+            code, message = run_action(game, key)
+            sys.stdout.write(message + "\n")
+            return code
     import curses
     curses.wrapper(tui, games)
     return 0

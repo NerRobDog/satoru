@@ -103,6 +103,17 @@ class FixableByThem(unittest.TestCase):
         self.assertEqual(r["fix"]["kind"], "manual")
         self.assertIn("ffmpeg", r["fix"]["hint"])
 
+    def test_missing_git_lfs_says_brew_install(self):
+        # Packs that reuse an existing game tree (Prime World's PW_GAME_TREE,
+        # the fullpath dev catalog) still need git-lfs for a fresh clone, and
+        # without a curated hint the generic fallback
+        # ("install git-lfs and put it on PATH") leaves out that it is a
+        # one-liner on this machine.
+        r = by_id(check({"tools": ["git-lfs"]}, tools=()), "tool:git-lfs")
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["fix"]["kind"], "manual")
+        self.assertEqual(r["fix"]["hint"], "brew install git-lfs")
+
 
 class Versions(unittest.TestCase):
     def test_same_major_is_enough(self):

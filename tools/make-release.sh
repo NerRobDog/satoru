@@ -17,9 +17,13 @@ VERSION="${1:-$(cat VERSION 2>/dev/null || echo "")}"
 [ -n "$VERSION" ] || { echo "no version: pass one, or write a VERSION file" >&2; exit 2; }
 
 STAGE="dist/satoru-$VERSION"
-rm -rf "$STAGE"; mkdir -p "$STAGE/launcher" "$STAGE/games"
+rm -rf "$STAGE"; mkdir -p "$STAGE/launcher/assets" "$STAGE/games"
 
 cp launcher/satoru.py "$STAGE/launcher/"
+# The mark satoru puts on a .app when a pack does not name its own exe icon
+# (or extracting it fails). Without this, install_bundle_icon has nothing to
+# fall back to in a release tarball, even though it does in a git checkout.
+cp launcher/assets/satoru-default.icns "$STAGE/launcher/assets/"
 cp satoru.command "$STAGE/"
 cp LICENSE DONATE.md "$STAGE/"
 printf '%s\n' "$VERSION" > "$STAGE/VERSION"
@@ -62,9 +66,10 @@ its hashes, and runs the pack's own installer.
 What each game needs today:
 
   Age of Empires IV   Works end to end. Setup downloads the pack (133 MB), which brings
-                      its own Wine engine and DXMT; CrossOver is not needed at runtime,
-                      though an existing CrossOver bottle with the game is used as the
-                      source of the files if you have one. macOS 26+, Rosetta, ~4 GB free.
+                      its own Wine engine and DXMT; CrossOver is not used, at setup or
+                      at runtime. Game files already on this Mac under
+                      ~/Games/*/steamapps are linked in, not copied; without them Steam
+                      downloads the game (~45 GB). macOS 26+, Rosetta, ~4 GB free.
 
   Overwatch 2         Shown as SOON here. It plays, but installing it is still by hand
                       and needs a DXMT you build yourself:
