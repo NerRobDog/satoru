@@ -66,7 +66,8 @@ hand-driven; `wip` = not for users yet.
 Adding a game means writing a `game.toml` and four commands; satoru does the
 rest. [`docs/pack-contract.md`](docs/pack-contract.md) is what you write it
 against — the manifest, the environment your commands get, the exit codes, and
-what is not implemented yet.
+what is not implemented yet. Building a launcher that offers satoru packs instead?
+[`docs/pack-contract-for-launchers.md`](docs/pack-contract-for-launchers.md) is the host side.
 
 ## Layout
 
